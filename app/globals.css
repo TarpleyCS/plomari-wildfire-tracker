@@ -814,6 +814,20 @@ button {
   line-height: 1.5;
 }
 
+.intel-detail__source {
+  width: fit-content;
+  margin-top: 3px;
+  color: var(--cyan);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.52rem;
+  letter-spacing: 0.08em;
+  text-decoration: none;
+}
+
+.intel-detail__source:hover {
+  text-decoration: underline;
+}
+
 .source-links {
   display: grid;
   grid-template-columns: 1fr 1fr;

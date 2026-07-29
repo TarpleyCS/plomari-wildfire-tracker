@@ -5,6 +5,7 @@ import type {
   LayerGroup,
   Map as LeafletMap,
   TileLayer,
+  WMSOptions,
 } from "leaflet";
 import "leaflet/dist/leaflet.css";
 
@@ -15,6 +16,7 @@ type LayerKey =
   | "satellite"
   | "local"
   | "wind"
+  | "smokeObserved"
   | "smoke"
   | "simulation";
 type BaseMode = "dark" | "satellite" | "terrain";
@@ -70,6 +72,8 @@ type IntelItem = {
   label: string;
   detail: string;
   confidence: Confidence;
+  sourceUrl?: string;
+  sourceLabel?: string;
 };
 
 type ThermalDetection = {
@@ -80,6 +84,84 @@ type ThermalDetection = {
   confidence: string;
   frp: number;
   footprint: string;
+};
+
+type LiveThermalDetection = {
+  id: string;
+  lat: number;
+  lon: number;
+  sensor: string;
+  satellite: string;
+  observedAt: string;
+  confidence: string;
+  frpMw: number | null;
+  scanKm: number | null;
+  trackKm: number | null;
+  daynight: string | null;
+};
+
+type ThermalPayload = {
+  generatedAt: string;
+  mode: "firms-area-api" | "gibs-wms-fallback";
+  latestObservedAt: string | null;
+  detections: LiveThermalDetection[];
+  errors: string[];
+  source: {
+    label: string;
+    docs: string;
+    refreshMinutes: number;
+    typicalLatencyHours: number;
+  };
+};
+
+type LiveUpdateItem = {
+  id: string;
+  title: string;
+  summary: string;
+  url: string;
+  sourceId: string;
+  sourceLabel: string;
+  sourceKind: "local-reporting" | "official-context";
+  publishedAt: string | null;
+  modifiedAt: string | null;
+  timeQuality: "exact" | "date-only" | "feed-order-only";
+  latestUpdateLabel: string | null;
+};
+
+type UpdatesPayload = {
+  generatedAt: string;
+  localTimeZone: "Europe/Athens";
+  refreshSeconds: number;
+  officialAlert: {
+    issuedAt: string;
+    lastManuallyVerifiedAt: string;
+    status: string;
+    manual: true;
+    action: string;
+    sourceUrl: string;
+  };
+  fireServiceIncident: {
+    status: "in-progress" | "partial-control" | "full-control" | "ended";
+    statusLabel: string;
+    municipality: string;
+    incidentType: string;
+    sourceAge: string | null;
+    fetchedAt: string;
+    sourceUrl: string;
+    official: true;
+  } | null;
+  sources: Array<{
+    id: string;
+    label: string;
+    url: string;
+    kind: "local-reporting" | "official-context";
+    timeQuality: string;
+    fetchedAt: string | null;
+    channelUpdatedAt: string | null;
+    status: "ok" | "error";
+  }>;
+  items: LiveUpdateItem[];
+  errors: string[];
 };
 
 const INCIDENT: LatLngTuple = [38.989013, 26.382489];
@@ -333,6 +415,11 @@ const intel: IntelItem[] = [
 
 const sources = [
   {
+    label: "Fire Service board",
+    href: "https://www.fireservice.gr/apps/fire2019/symvanta/page.php",
+    kind: "Official incident status · automatic",
+  },
+  {
     label: "112 Greece",
     href: "https://x.com/112Greece/status/2082468150189167080",
     kind: "Latest official instruction · 16:58",
@@ -364,8 +451,13 @@ const sources = [
   },
   {
     label: "NASA FIRMS",
-    href: "https://firms.modaps.eosdis.nasa.gov/content/descriptions/FIRMS_VIIRS_Firehotspots.html",
-    kind: "Thermal data interpretation",
+    href: "https://firms.modaps.eosdis.nasa.gov/api/area/",
+    kind: "Thermal points · server-side API",
+  },
+  {
+    label: "NASA GIBS",
+    href: "https://nasa-gibs.github.io/gibs-api-docs/access-advanced-topics/#vector-visualizations",
+    kind: "No-key thermal / aerosol overlay",
   },
   {
     label: "Open-Meteo",
@@ -496,6 +588,24 @@ function formatGreeceTime(value: string | undefined) {
   }).format(parsed);
 }
 
+function formatGreeceDateTime(value: string | null | undefined) {
+  if (!value) return "—";
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return "—";
+  return new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Europe/Athens",
+    day: "2-digit",
+    month: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(parsed);
+}
+
+function utcDate(value: number) {
+  return new Date(value).toISOString().slice(0, 10);
+}
+
 function compass(degrees: number) {
   const points = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
   return points[Math.round((((degrees % 360) + 360) % 360) / 45) % 8];
@@ -517,12 +627,18 @@ export default function Home() {
   const [activeIntel, setActiveIntel] = useState("overnight-hotspots");
   const [windData, setWindData] = useState<WindPayload | null>(null);
   const [windError, setWindError] = useState(false);
+  const [updatesData, setUpdatesData] = useState<UpdatesPayload | null>(null);
+  const [updatesError, setUpdatesError] = useState(false);
+  const [thermalData, setThermalData] = useState<ThermalPayload | null>(null);
+  const [thermalError, setThermalError] = useState(false);
+  const [satelliteEpoch, setSatelliteEpoch] = useState(() => Date.now());
   const [online, setOnline] = useState(true);
   const [layers, setLayers] = useState<Record<LayerKey, boolean>>({
     official: true,
-    satellite: false,
+    satellite: true,
     local: true,
     wind: true,
+    smokeObserved: false,
     smoke: true,
     simulation: false,
   });
@@ -535,7 +651,54 @@ export default function Home() {
     () => Number((spreadRates[beaufort] * hour).toFixed(1)),
     [beaufort, hour],
   );
-  const active = intel.find((item) => item.id === activeIntel) ?? intel[0];
+  const displayIntel = useMemo<IntelItem[]>(() => {
+    const liveItems =
+      updatesData?.items.slice(0, 6).map((item) => {
+        const timestamp = item.modifiedAt ?? item.publishedAt;
+        const detailPrefix =
+          item.sourceKind === "official-context"
+            ? "Official context feed; not a 112 dispatch. "
+            : "Near-real-time local reporting; not independently confirmed. ";
+        return {
+          id: `feed-${item.id}`,
+          time:
+            item.latestUpdateLabel ??
+            (timestamp ? formatGreeceTime(timestamp) : "RSS"),
+          label: item.title,
+          detail: `${detailPrefix}${item.summary}`,
+          confidence:
+            item.sourceKind === "official-context"
+              ? ("official" as const)
+              : ("reported" as const),
+          sourceUrl: item.url,
+          sourceLabel: item.sourceLabel,
+        };
+      }) ?? [];
+
+    const fireService = updatesData?.fireServiceIncident
+      ? [
+          {
+            id: "fire-service-live-status",
+            time: formatGreeceTime(
+              updatesData.fireServiceIncident.fetchedAt,
+            ),
+            label: `Fire Service: ${updatesData.fireServiceIncident.statusLabel}`,
+            detail: `The official incident board lists the Plomari landfill fire as ${updatesData.fireServiceIncident.statusLabel.toLowerCase()}${
+              updatesData.fireServiceIncident.sourceAge
+                ? `; source-reported update age ${updatesData.fireServiceIncident.sourceAge}`
+                : ""
+            }. The board does not provide a perimeter or public route instruction.`,
+            confidence: "official" as const,
+            sourceUrl: updatesData.fireServiceIncident.sourceUrl,
+            sourceLabel: "Hellenic Fire Service",
+          },
+        ]
+      : [];
+
+    return [...fireService, ...liveItems, ...intel];
+  }, [updatesData]);
+  const active =
+    displayIntel.find((item) => item.id === activeIntel) ?? displayIntel[0];
   const fireWind =
     windData?.locations.find((location) => location.id === "fire")?.current ??
     WIND_FALLBACK;
@@ -546,6 +709,33 @@ export default function Home() {
   );
   const windObservedTime = formatGreeceTime(fireWind.time);
   const retrievedTime = formatGreeceTime(windData?.generatedAt);
+  const thermalDetections = useMemo<LiveThermalDetection[]>(
+    () =>
+      thermalData?.detections.length
+        ? thermalData.detections
+        : THERMAL_DETECTIONS.map((detection) => ({
+            id: `snapshot-${detection.id}`,
+            lat: detection.point[0],
+            lon: detection.point[1],
+            sensor: detection.sensor,
+            satellite: detection.sensor,
+            observedAt: `2026-07-29T${detection.pass}:00+03:00`,
+            confidence: detection.confidence,
+            frpMw: detection.frp,
+            scanKm: Number(detection.footprint.split(" × ")[0]),
+            trackKm: Number(
+              detection.footprint.split(" × ")[1]?.split(" ")[0],
+            ),
+            daynight: null,
+          })),
+    [thermalData],
+  );
+  const thermalLatestTime = formatGreeceTime(
+    thermalData?.latestObservedAt ?? thermalDetections[0]?.observedAt,
+  );
+  const updatesRetrievedTime = formatGreeceTime(updatesData?.generatedAt);
+  const officialStatus =
+    updatesData?.fireServiceIncident?.statusLabel ?? "STATUS PENDING";
 
   useEffect(() => {
     const format = () =>
@@ -602,6 +792,58 @@ export default function Home() {
     };
     const initial = window.setTimeout(() => void refreshWind(), 0);
     const timer = window.setInterval(() => void refreshWind(), 300_000);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(initial);
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const refreshUpdates = async () => {
+      try {
+        const response = await fetch("/api/updates", { cache: "no-store" });
+        if (!response.ok) throw new Error("updates request failed");
+        const payload = (await response.json()) as UpdatesPayload;
+        if (!cancelled) {
+          setUpdatesData(payload);
+          setUpdatesError(false);
+        }
+      } catch {
+        if (!cancelled) setUpdatesError(true);
+      }
+    };
+    const initial = window.setTimeout(() => void refreshUpdates(), 0);
+    const timer = window.setInterval(() => void refreshUpdates(), 60_000);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(initial);
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const refreshThermal = async () => {
+      try {
+        const response = await fetch("/api/thermal", { cache: "no-store" });
+        if (!response.ok) throw new Error("thermal request failed");
+        const payload = (await response.json()) as ThermalPayload;
+        if (!cancelled) {
+          setThermalData(payload);
+          setThermalError(payload.errors.length > 0);
+          setSatelliteEpoch(Date.now());
+        }
+      } catch {
+        if (!cancelled) {
+          setThermalError(true);
+          setSatelliteEpoch(Date.now());
+        }
+      }
+    };
+    const initial = window.setTimeout(() => void refreshThermal(), 0);
+    const timer = window.setInterval(() => void refreshThermal(), 300_000);
     return () => {
       cancelled = true;
       window.clearTimeout(initial);
@@ -761,10 +1003,38 @@ export default function Home() {
     }
 
     if (layers.satellite) {
-      THERMAL_DETECTIONS.forEach((detection) => {
+      const thermalDate = utcDate(satelliteEpoch);
+      [
+        "VIIRS_NOAA20_Thermal_Anomalies_375m_All",
+        "VIIRS_NOAA21_Thermal_Anomalies_375m_All",
+        "VIIRS_SNPP_Thermal_Anomalies_375m_All",
+      ].forEach((layerName) => {
+        L.tileLayer
+          .wms(
+            "https://gibs.earthdata.nasa.gov/wms/epsg4326/best/wms.cgi",
+            {
+              layers: layerName,
+              format: "image/png",
+              transparent: true,
+              styles: "size15",
+              version: "1.1.1",
+              opacity: 0.74,
+              attribution: "NASA GIBS / FIRMS",
+              time: thermalDate,
+              refresh: String(Math.floor(satelliteEpoch / 300_000)),
+            } as WMSOptions,
+          )
+          .addTo(group);
+      });
+
+      thermalDetections.forEach((detection) => {
         const high =
-          detection.confidence === "High" || detection.frp >= 30;
-        L.circleMarker(detection.point, {
+          detection.confidence === "High" || (detection.frpMw ?? 0) >= 30;
+        const footprint =
+          detection.scanKm !== null && detection.trackKm !== null
+            ? `${detection.scanKm.toFixed(2)} × ${detection.trackKm.toFixed(2)} km`
+            : "nominal 375 m pixel";
+        L.circleMarker([detection.lat, detection.lon], {
           radius: high ? 7 : 5,
           color: high ? "#ff3b24" : "#ff9f1c",
           weight: high ? 2 : 1.5,
@@ -772,7 +1042,7 @@ export default function Home() {
           fillOpacity: high ? 0.72 : 0.52,
         })
           .bindPopup(
-            `<div class="popup-copy"><strong>${detection.sensor}</strong><br>${detection.pass} Greece · ${detection.confidence}<br>FRP ${detection.frp.toFixed(2)} MW<br><span>Nominal pixel ${detection.footprint} · not a perimeter</span></div>`,
+            `<div class="popup-copy"><strong>${detection.sensor}</strong><br>${formatGreeceDateTime(detection.observedAt)} Greece · ${detection.confidence}<br>FRP ${detection.frpMw?.toFixed(2) ?? "—"} MW<br><span>${footprint} · satellite pixel center, not a perimeter or proof of current flame</span></div>`,
           )
           .addTo(group);
       });
@@ -874,6 +1144,29 @@ export default function Home() {
       }
     }
 
+    if (layers.smokeObserved) {
+      L.tileLayer
+        .wms(
+          "https://gibs.earthdata.nasa.gov/wms/epsg3857/nrt/wms.cgi",
+          {
+            layers:
+              "VIIRS_NOAA20_Aerosol_Type_Deep_Blue_Land_Ocean_v2.1_NRT",
+            format: "image/png",
+            transparent: true,
+            version: "1.1.1",
+            opacity: 0.46,
+            attribution: "NASA GIBS VIIRS aerosol type",
+            time: utcDate(satelliteEpoch),
+            refresh: String(Math.floor(satelliteEpoch / 300_000)),
+          } as WMSOptions,
+        )
+        .bindTooltip(
+          "NASA VIIRS daylight aerosol classification · smoke retrieval is coarse, cloud-sensitive and not surface PM2.5",
+          { sticky: true },
+        )
+        .addTo(group);
+    }
+
     if (layers.smoke) {
       const outer = scenarioShape(
         INCIDENT,
@@ -942,6 +1235,8 @@ export default function Home() {
     downwindHeading,
     smokeDistance,
     smokeMinutes,
+    satelliteEpoch,
+    thermalDetections,
   ]);
 
   const toggleLayer = (key: LayerKey) => {
@@ -993,12 +1288,14 @@ export default function Home() {
           <p>LOCAL INCIDENT PICTURE · MULTISOURCE OSINT</p>
         </div>
 
-        <div className="classification">PUBLIC SAFETY // NO OFFICIAL ALL-CLEAR</div>
+        <div className="classification">
+          FIRE SERVICE // {officialStatus}
+        </div>
 
         <div className="clock-block">
           <span>GREECE LOCAL</span>
           <strong>{clock || "--:--:--"}</strong>
-          <small>STATUS REVIEW 22:00</small>
+          <small>FIRE BOARD AUTO · 112 MANUAL</small>
         </div>
       </header>
 
@@ -1055,7 +1352,7 @@ export default function Home() {
           <div className="hud-heading">
             <div>
               <span>DATA LAYERS</span>
-              <small>6 LAYERS // SOURCE + FRESHNESS VISIBLE</small>
+              <small>7 LAYERS // SOURCE + FRESHNESS VISIBLE</small>
             </div>
             <button type="button" onClick={showOperationalView}>
               FRAME
@@ -1075,8 +1372,8 @@ export default function Home() {
                 key: "satellite" as LayerKey,
                 icon: "✦",
                 label: "Thermal detections",
-                detail: "NASA FIRMS · latest 16:06",
-                count: "15",
+                detail: `${thermalError ? "Fallback / retrying" : "NASA FIRMS NRT"} · latest ${thermalLatestTime}`,
+                count: String(thermalDetections.length),
               },
               {
                 key: "local" as LayerKey,
@@ -1091,6 +1388,13 @@ export default function Home() {
                 label: "Wind profile",
                 detail: `Model valid ${windObservedTime} · polls 5 min`,
                 count: "4",
+              },
+              {
+                key: "smokeObserved" as LayerKey,
+                icon: "◌",
+                label: "Satellite aerosol / smoke",
+                detail: "NASA VIIRS NRT · daylight snapshot",
+                count: "NRT",
               },
               {
                 key: "smoke" as LayerKey,
@@ -1225,13 +1529,15 @@ export default function Home() {
           <div className="hud-heading">
             <div>
               <span>INCIDENT WIRE</span>
-              <small>GREECE TIME // NEWEST FIRST</small>
+              <small>
+                GREECE TIME // {updatesError ? "SNAPSHOT · RETRYING" : `RSS POLL ${updatesRetrievedTime}`}
+              </small>
             </div>
             <span className="recording-dot">REC</span>
           </div>
 
           <div className="intel-list">
-            {intel.map((item) => (
+            {displayIntel.map((item) => (
               <button
                 type="button"
                 key={item.id}
@@ -1251,6 +1557,16 @@ export default function Home() {
             <span>{confidenceLabel(active.confidence)}</span>
             <strong>{active.label}</strong>
             <p>{active.detail}</p>
+            {active.sourceUrl && (
+              <a
+                className="intel-detail__source"
+                href={active.sourceUrl}
+                target="_blank"
+                rel="noreferrer"
+              >
+                {active.sourceLabel ?? "Direct source"} ↗
+              </a>
+            )}
           </div>
 
           <div className="source-links">
@@ -1323,13 +1639,15 @@ export default function Home() {
       <section className="mission-hud" aria-label="Current operating picture">
         <div className="mission-primary">
           <span>OFFICIAL STATUS</span>
-          <strong>NO OFFICIAL ALL-CLEAR</strong>
-          <small>Latest 112 instruction 16:58 · reviewed 22:00</small>
+          <strong>{officialStatus}</strong>
+          <small>
+            Fire Service auto · latest 112 instruction remains manual
+          </small>
         </div>
         <div>
-          <span>THERMAL</span>
-          <strong>15 SNAPSHOT PIXELS</strong>
-          <small>Latest pass 16:06 · layer off by default</small>
+          <span>THERMAL · {thermalLatestTime}</span>
+          <strong>{thermalDetections.length} NASA PIXELS</strong>
+          <small>Poll 5 min · satellite latency typically ≤3h</small>
         </div>
         <div>
           <span>FIRE-GRID MODEL · {windObservedTime}</span>
@@ -1340,9 +1658,9 @@ export default function Home() {
           <small>Gust {fireWind.gustKmh.toFixed(0)} km/h · model, not sensor</small>
         </div>
         <div>
-          <span>NIGHT OPERATIONS · LOCAL REPORT</span>
-          <strong>SCATTERED HOTSPOTS</strong>
-          <small>Agios Antonios → Megalochori · aerial drops ended</small>
+          <span>INCIDENT WIRE · {updatesRetrievedTime}</span>
+          <strong>{updatesError ? "SNAPSHOT / RETRYING" : "POLLING 60 SECONDS"}</strong>
+          <small>Local RSS + official feeds · timestamps in Greece time</small>
         </div>
       </section>
 

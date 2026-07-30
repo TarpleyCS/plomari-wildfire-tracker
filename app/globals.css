@@ -1076,20 +1076,40 @@ button {
 
 .intel-item {
   display: grid;
-  grid-template-columns: 68px minmax(0, 1fr);
-  gap: 8px;
-  width: 100%;
-  padding: 8px 3px;
-  text-align: left;
-  border: 0;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: stretch;
   border-bottom: 1px solid var(--line-soft);
-  background: transparent;
-  cursor: pointer;
 }
 
 .intel-item:hover,
 .intel-item.is-active {
   background: rgba(85, 221, 255, 0.045);
+}
+
+.intel-item__select {
+  display: grid;
+  grid-template-columns: 68px minmax(0, 1fr);
+  gap: 8px;
+  min-width: 0;
+  padding: 8px 3px;
+  text-align: left;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.intel-item__link {
+  display: grid;
+  min-width: 38px;
+  place-items: center;
+  color: var(--cyan);
+  border-left: 1px solid var(--line-soft);
+  font-size: 0.85rem;
+  text-decoration: none;
+}
+
+.intel-item__link:hover {
+  background: rgba(85, 221, 255, 0.1);
 }
 
 .intel-item time {
@@ -1953,8 +1973,12 @@ button {
     font-size: 0.6875rem;
   }
 
-  .intel-item {
+  .intel-item__select {
     grid-template-columns: 82px minmax(0, 1fr);
+  }
+
+  .intel-item__link {
+    min-width: 44px;
   }
 
   .intel-item time,
@@ -2396,6 +2420,17 @@ button {
   overflow: visible;
 }
 
+.panel-move {
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.panel-move:active {
+  cursor: grabbing;
+}
+
 .hud-tabs {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -2529,6 +2564,11 @@ button {
   .hud-tabs button {
     min-height: 44px;
     font-size: 0.6875rem;
+  }
+
+  /* The mobile panel is a fixed bottom sheet; dragging is desktop-only. */
+  .panel-move {
+    display: none;
   }
 
   .locate-readout__center {

@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { CSSProperties } from "react";
+import type { CSSProperties, PointerEvent as ReactPointerEvent } from "react";
 import type {
   LayerGroup,
   Map as LeafletMap,
@@ -967,6 +967,14 @@ export default function Home() {
     "layers" | "thermal" | "wind" | "updates"
   >("layers");
   const [alertCollapsed, setAlertCollapsed] = useState(false);
+  const [panelPos, setPanelPos] = useState<{ x: number; y: number } | null>(
+    null,
+  );
+  const panelDrag = useRef<{
+    pointerId: number;
+    offsetX: number;
+    offsetY: number;
+  } | null>(null);
 
   const scenarioDistance = useMemo(
     () => Number((spreadRates[beaufort] * hour).toFixed(1)),
@@ -1245,6 +1253,42 @@ export default function Home() {
 
   const closePanels = () => {
     setPanelOpen(false);
+  };
+
+  // Pointer-capture drag for the desktop panel: the move button owns the
+  // pointer for the whole gesture, so no window-level listeners are needed.
+  const onPanelDragStart = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    if (compact) return;
+    const panel = document.getElementById("layers-sheet");
+    if (!panel) return;
+    const rect = panel.getBoundingClientRect();
+    panelDrag.current = {
+      pointerId: event.pointerId,
+      offsetX: event.clientX - rect.left,
+      offsetY: event.clientY - rect.top,
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+
+  const onPanelDragMove = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    const drag = panelDrag.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    setPanelPos({
+      x: Math.min(
+        Math.max(event.clientX - drag.offsetX, 8),
+        window.innerWidth - 120,
+      ),
+      y: Math.min(
+        Math.max(event.clientY - drag.offsetY, 8),
+        window.innerHeight - 120,
+      ),
+    });
+  };
+
+  const onPanelDragEnd = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    if (panelDrag.current?.pointerId === event.pointerId) {
+      panelDrag.current = null;
+    }
   };
 
   const setAlertCollapsedPersistent = (collapsed: boolean) => {
@@ -2615,6 +2659,17 @@ export default function Home() {
           className="layer-hud"
           id="layers-sheet"
           aria-label={localize(language, "Data layers", "Επίπεδα δεδομένων")}
+          style={
+            panelPos && !compact
+              ? {
+                  left: panelPos.x,
+                  top: panelPos.y,
+                  right: "auto",
+                  bottom: "auto",
+                  maxHeight: `calc(100dvh - ${panelPos.y + 16}px)`,
+                }
+              : undefined
+          }
         >
           <div className="hud-heading">
             <div>
@@ -2670,6 +2725,27 @@ export default function Home() {
                   {localize(language, "REC", "ΖΩΝΤΑΝΑ")}
                 </span>
               )}
+              <button
+                type="button"
+                className="panel-move"
+                onPointerDown={onPanelDragStart}
+                onPointerMove={onPanelDragMove}
+                onPointerUp={onPanelDragEnd}
+                onPointerCancel={onPanelDragEnd}
+                onDoubleClick={() => setPanelPos(null)}
+                aria-label={localize(
+                  language,
+                  "Move panel; double-click to reset position",
+                  "Μετακίνηση πίνακα· διπλό κλικ για επαναφορά θέσης",
+                )}
+                title={localize(
+                  language,
+                  "Drag to move · double-click to reset",
+                  "Σύρετε για μετακίνηση · διπλό κλικ για επαναφορά",
+                )}
+              >
+                ✥
+              </button>
               <button type="button" onClick={showOperationalView}>
                 {localize(language, "FRAME", "ΠΡΟΒΟΛΗ")}
               </button>
@@ -3333,33 +3409,51 @@ export default function Home() {
             <>
           <div className="intel-list">
             {displayIntel.map((item) => (
-              <button
-                type="button"
+              <div
                 key={item.id}
                 className={item.id === activeIntel ? "intel-item is-active" : "intel-item"}
-                onClick={() => setActiveIntel(item.id)}
               >
-                <time>
-                  <span>{item.time}</span>
-                  {item.archived && (
+                <button
+                  type="button"
+                  className="intel-item__select"
+                  onClick={() => setActiveIntel(item.id)}
+                >
+                  <time>
+                    <span>{item.time}</span>
+                    {item.archived && (
+                      <small>
+                        {localize(language, "29 JUL 2026", "29 ΙΟΥΛ 2026")}
+                      </small>
+                    )}
+                  </time>
+                  <span>
+                    <strong>{item.label}</strong>
                     <small>
-                      {localize(language, "29 JUL 2026", "29 ΙΟΥΛ 2026")}
+                      {item.archived
+                        ? `${localize(language, "ARCHIVE", "ΑΡΧΕΙΟ")} · `
+                        : ""}
+                      {confidenceLabel(item.confidence, language)}
+                      {item.category
+                        ? ` · ${updateCategoryLabel(item.category, language)}`
+                        : ""}
                     </small>
-                  )}
-                </time>
-                <span>
-                  <strong>{item.label}</strong>
-                  <small>
-                    {item.archived
-                      ? `${localize(language, "ARCHIVE", "ΑΡΧΕΙΟ")} · `
-                      : ""}
-                    {confidenceLabel(item.confidence, language)}
-                    {item.category
-                      ? ` · ${updateCategoryLabel(item.category, language)}`
-                      : ""}
-                  </small>
-                </span>
-              </button>
+                  </span>
+                </button>
+                {item.sourceUrl && (
+                  <a
+                    className="intel-item__link"
+                    href={item.sourceUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    aria-label={`${localize(language, "Open source", "Άνοιγμα πηγής")}: ${
+                      item.sourceLabel ??
+                      localize(language, "article", "άρθρο")
+                    }`}
+                  >
+                    ↗
+                  </a>
+                )}
+              </div>
             ))}
           </div>
 

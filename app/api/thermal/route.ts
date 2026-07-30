@@ -11,6 +11,9 @@ const INCIDENT = {
   radiusKm: 8,
 };
 
+// First UTC calendar day of the incident; historical queries cannot precede it.
+const INCIDENT_START_UTC_DATE = "2026-07-29";
+
 const BOUNDS = {
   west: 26.2,
   south: 38.85,
@@ -233,15 +236,18 @@ async function fetchDataset(
   mapKey: string,
   dataset: DatasetConfig,
   nowMs: number,
+  date: string | null,
 ): Promise<DatasetResult> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 12_000);
   const area = `${BOUNDS.west},${BOUNDS.south},${BOUNDS.east},${BOUNDS.north}`;
 
   try {
-    // Query two UTC dates, then enforce an exact rolling 24-hour window below.
+    // Live mode queries two UTC dates, then enforces an exact rolling 24-hour
+    // window below. Historical mode anchors the query to one UTC calendar day.
+    const range = date ? `1/${date}` : "2";
     const response = await fetch(
-      `${FIRMS_AREA_ENDPOINT}/${encodeURIComponent(mapKey)}/${dataset.id}/${area}/2`,
+      `${FIRMS_AREA_ENDPOINT}/${encodeURIComponent(mapKey)}/${dataset.id}/${area}/${range}`,
       {
         cache: "no-store",
         headers: { Accept: "text/csv" },
@@ -274,7 +280,12 @@ async function fetchDataset(
       throw new UpstreamError("invalid_response", "FIRMS returned an error");
     }
 
-    const fromMs = nowMs - MAX_AGE_HOURS * 60 * 60 * 1000;
+    const fromMs = date
+      ? Date.parse(`${date}T00:00:00Z`)
+      : nowMs - MAX_AGE_HOURS * 60 * 60 * 1000;
+    const toMs = date
+      ? Math.min(fromMs + 24 * 60 * 60 * 1000, nowMs)
+      : nowMs;
     const records = parseCsv(body)
       .map((row): ThermalDetection | null => {
         const lat = finiteNumber(row.latitude);
@@ -293,7 +304,7 @@ async function fetchDataset(
         }
 
         const observedMs = Date.parse(observedAt);
-        if (observedMs < fromMs || observedMs > nowMs) {
+        if (observedMs < fromMs || observedMs > toMs) {
           return null;
         }
 
@@ -401,23 +412,61 @@ function clusterSatellitePasses(detections: ThermalDetection[]) {
     );
 }
 
-function responseHeaders() {
+function responseHeaders(completedHistoricalDay: boolean) {
+  // A finished UTC day can no longer change upstream, so it may cache far
+  // longer than the live rolling window.
   return {
-    "Cache-Control":
-      "public, max-age=15, s-maxage=120, stale-while-revalidate=180",
+    "Cache-Control": completedHistoricalDay
+      ? "public, max-age=300, s-maxage=3600, stale-while-revalidate=86400"
+      : "public, max-age=15, s-maxage=120, stale-while-revalidate=180",
   };
 }
 
-export async function GET() {
+export async function GET(request: Request) {
   const requestStartedAt = new Date().toISOString();
   const nowMs = Date.now();
   const mapKey = process.env.FIRMS_MAP_KEY?.trim();
+
+  const rawDate = new URL(request.url).searchParams.get("date");
+  let date: string | null = null;
+  if (rawDate !== null) {
+    const todayUtc = new Date(nowMs).toISOString().slice(0, 10);
+    const valid =
+      /^\d{4}-\d{2}-\d{2}$/.test(rawDate) &&
+      !Number.isNaN(Date.parse(`${rawDate}T00:00:00Z`)) &&
+      rawDate >= INCIDENT_START_UTC_DATE &&
+      rawDate <= todayUtc;
+    if (!valid) {
+      return Response.json(
+        {
+          error: "invalid_date",
+          message: `date must be a UTC calendar day between ${INCIDENT_START_UTC_DATE} and ${todayUtc}`,
+        },
+        { status: 400 },
+      );
+    }
+    date = rawDate;
+  }
+  const dayStartMs = date ? Date.parse(`${date}T00:00:00Z`) : null;
+  const completedHistoricalDay =
+    dayStartMs !== null && dayStartMs + 24 * 60 * 60 * 1000 <= nowMs;
+
   const query = {
     bounds: BOUNDS,
     incidentCenter: { lat: INCIDENT.lat, lon: INCIDENT.lon },
     incidentRadiusKm: INCIDENT.radiusKm,
-    from: new Date(nowMs - MAX_AGE_HOURS * 60 * 60 * 1000).toISOString(),
-    to: new Date(nowMs).toISOString(),
+    mode: date ? ("historical" as const) : ("live" as const),
+    date,
+    from:
+      dayStartMs !== null
+        ? new Date(dayStartMs).toISOString()
+        : new Date(nowMs - MAX_AGE_HOURS * 60 * 60 * 1000).toISOString(),
+    to:
+      dayStartMs !== null
+        ? new Date(
+            Math.min(dayStartMs + 24 * 60 * 60 * 1000, nowMs),
+          ).toISOString()
+        : new Date(nowMs).toISOString(),
     maxAgeHours: MAX_AGE_HOURS,
   };
 
@@ -471,12 +520,12 @@ export async function GET() {
             "Orbital snapshots; the three-satellite constellation typically provides several looks per day, not a continuous live feed.",
         },
       },
-      { headers: responseHeaders() },
+      { headers: responseHeaders(completedHistoricalDay) },
     );
   }
 
   const results = await Promise.all(
-    DATASETS.map((dataset) => fetchDataset(mapKey, dataset, nowMs)),
+    DATASETS.map((dataset) => fetchDataset(mapKey, dataset, nowMs, date)),
   );
   const successful = results.filter((result) => result.status === "ok");
   const failed = results.filter((result) => result.status === "error");
@@ -595,6 +644,6 @@ export async function GET() {
           "Orbital snapshots; the three-satellite constellation typically provides several looks per day, not a continuous live feed.",
       },
     },
-    { headers: responseHeaders() },
+    { headers: responseHeaders(completedHistoricalDay) },
   );
 }

@@ -8,6 +8,16 @@ import type {
   WMSOptions,
 } from "leaflet";
 import "leaflet/dist/leaflet.css";
+import {
+  LIVE_AS_OF,
+  clampAsOfEpoch,
+  effectiveAsOfEpoch,
+  filterAtOrBefore,
+  isTimestampVisibleAt,
+  latestAtOrBefore,
+  timestampEpoch,
+  type AsOfSelection,
+} from "@/lib/as-of";
 
 type LatLngTuple = [number, number];
 type Confidence = "official" | "observed" | "reported" | "modeled";
@@ -72,6 +82,7 @@ type WindPayload = {
 type IntelItem = {
   id: string;
   time: string;
+  occurredAt?: string | null;
   label: string;
   detail: string;
   confidence: Confidence;
@@ -266,6 +277,10 @@ type UpdatesPayload = {
 };
 
 const INCIDENT: LatLngTuple = [38.989013, 26.382489];
+const INCIDENT_STARTED_AT = "2026-07-29T10:30:00Z";
+const INCIDENT_STARTED_EPOCH = Date.parse(INCIDENT_STARTED_AT);
+const OFFICIAL_ALERT_ISSUED_AT = "2026-07-29T13:58:00Z";
+const FIELD_REPORT_OCCURRED_AT = "2026-07-29T17:50:00Z";
 const PLOMARI_BEACH: LatLngTuple = [38.9752, 26.3714];
 const AGIOS_ISIDOROS: LatLngTuple = [38.9702, 26.3927];
 const MELINTA: LatLngTuple = [38.9875, 26.3131];
@@ -274,6 +289,25 @@ const PLAGIA: LatLngTuple = [38.98234, 26.39769];
 const PERAMA: LatLngTuple = [39.0429, 26.50556];
 const AGIOS_ANTONIOS: LatLngTuple = [38.9817634, 26.4073025];
 const MEGALOCHORI: LatLngTuple = [39.0173137, 26.3687164];
+
+const STATIC_INTEL_OCCURRED_AT: Record<string, string> = {
+  "overnight-hotspots": "2026-07-29T17:50:00Z",
+  "no-active-front": "2026-07-29T16:55:00Z",
+  homes: "2026-07-29T16:25:00Z",
+  smoke: "2026-07-29T14:50:00Z",
+  evacuation: OFFICIAL_ALERT_ISSUED_AT,
+  reinforced: "2026-07-29T13:34:00Z",
+  modis: "2026-07-29T13:06:00Z",
+  viirs: "2026-07-29T12:17:00Z",
+  ignition: "2026-07-29T11:00:00Z",
+};
+
+const CURRENT_ONLY_LAYER_KEYS = new Set<LayerKey>([
+  "satelliteRaster",
+  "wind",
+  "smokeObserved",
+  "smoke",
+]);
 
 const WIND_FALLBACK: WindCurrent = {
   time: "2026-07-29T22:00",
@@ -567,13 +601,19 @@ const sourcesEl = [
   },
 ];
 
-const spreadRates: Record<number, number> = {
+type Beaufort = 3 | 4 | 5 | 6 | 7;
+
+const spreadRates: Record<Beaufort, number> = {
   3: 0.28,
   4: 0.42,
   5: 0.58,
   6: 0.78,
   7: 1.02,
 };
+
+function isBeaufort(value: number): value is Beaufort {
+  return Object.hasOwn(spreadRates, value);
+}
 
 const BASEMAPS: Record<
   BaseMode,
@@ -844,6 +884,8 @@ export default function Home() {
   const [ready, setReady] = useState(false);
   const [clock, setClock] = useState("");
   const [ageEpoch, setAgeEpoch] = useState(() => Date.now());
+  const [asOfEpoch, setAsOfEpoch] = useState<number | null>(null);
+  const [isScrubbing, setIsScrubbing] = useState(false);
   const [baseMode, setBaseMode] = useState<BaseMode>("satellite");
   const [language, setLanguage] = useState<Language>("en");
   const [compact, setCompact] = useState(false);
@@ -871,7 +913,7 @@ export default function Home() {
     simulation: false,
   });
   const [hour, setHour] = useState(2);
-  const [beaufort, setBeaufort] = useState(6);
+  const [beaufort, setBeaufort] = useState<Beaufort>(6);
   const [heading, setHeading] = useState(218);
   const [smokeMinutes, setSmokeMinutes] = useState(15);
 
@@ -879,11 +921,36 @@ export default function Home() {
     () => Number((spreadRates[beaufort] * hour).toFixed(1)),
     [beaufort, hour],
   );
+  const asOfSelection = useMemo<AsOfSelection>(
+    () =>
+      asOfEpoch === null
+        ? LIVE_AS_OF
+        : { mode: "historical", epochMs: asOfEpoch },
+    [asOfEpoch],
+  );
+  const isLive = asOfSelection.mode === "live";
+  const effectiveEpoch = effectiveAsOfEpoch(asOfSelection, ageEpoch);
+  const asOfLabel = formatGreeceDateTime(
+    new Date(effectiveEpoch).toISOString(),
+    language,
+  );
+  const showArchivedOfficialAlert = isTimestampVisibleAt(
+    OFFICIAL_ALERT_ISSUED_AT,
+    asOfSelection,
+  );
+  const showFieldReport = isTimestampVisibleAt(
+    FIELD_REPORT_OCCURRED_AT,
+    asOfSelection,
+  );
   const staticIntel = language === "el" ? intelEl : intelEn;
   const localizedSources = language === "el" ? sourcesEl : sourcesEn;
   const displayIntel = useMemo<IntelItem[]>(() => {
     const liveItems =
-      updatesData?.items.slice(0, 6).map((item) => {
+      filterAtOrBefore(
+        updatesData?.items ?? [],
+        (item) => item.modifiedAt ?? item.publishedAt,
+        asOfSelection,
+      ).slice(0, 6).map((item) => {
         const timestamp = item.modifiedAt ?? item.publishedAt;
         const localizedSummary =
           language === "el"
@@ -914,6 +981,7 @@ export default function Home() {
           time:
             item.latestUpdateLabel ??
             (timestamp ? formatGreeceTime(timestamp) : "RSS"),
+          occurredAt: timestamp,
           label: item.title,
           detail: `${detailPrefix}${localizedSummary}`,
           confidence:
@@ -927,15 +995,16 @@ export default function Home() {
           actionRequired: item.actionRequired,
           live: true,
         };
-      }) ?? [];
+      });
 
-    const fireService = updatesData?.fireServiceIncident
+    const fireService = isLive && updatesData?.fireServiceIncident
       ? [
           {
             id: "fire-service-live-status",
             time: formatGreeceTime(
               updatesData.fireServiceIncident.fetchedAt,
             ),
+            occurredAt: updatesData.fireServiceIncident.fetchedAt,
             label: `${localize(language, "Fire Service", "Πυροσβεστικό Σώμα")}: ${localizeFireStatus(
               updatesData.fireServiceIncident.status,
               updatesData.fireServiceIncident.statusLabel,
@@ -975,36 +1044,57 @@ export default function Home() {
 
     const archivedChronology = staticIntel.map((item) => ({
       ...item,
+      occurredAt: STATIC_INTEL_OCCURRED_AT[item.id] ?? null,
       archived: true,
     }));
 
-    return [...fireService, ...liveItems, ...archivedChronology];
-  }, [language, staticIntel, updatesData]);
+    const combined = filterAtOrBefore(
+      [...fireService, ...liveItems, ...archivedChronology],
+      (item) => item.occurredAt,
+      asOfSelection,
+    );
+
+    if (isLive) return combined;
+    return combined.sort(
+      (left, right) =>
+        (timestampEpoch(right.occurredAt) ?? 0) -
+        (timestampEpoch(left.occurredAt) ?? 0),
+    );
+  }, [asOfSelection, isLive, language, staticIntel, updatesData]);
   const active =
     displayIntel.find((item) => item.id === activeIntel) ??
+    displayIntel[0] ??
     {
-      id: "live-wire-pending",
-      time: "LIVE",
+      id: isLive ? "live-wire-pending" : "history-wire-empty",
+      time: isLive ? "LIVE" : "—",
       label: localize(
         language,
-        updatesError
-          ? "Live-source retry in progress"
-          : updatesData
-            ? "No current live item returned"
-            : "Checking live sources",
-        updatesError
-          ? "Νέα προσπάθεια σύνδεσης με ζωντανές πηγές"
-          : updatesData
-            ? "Δεν επιστράφηκε τρέχουσα ζωντανή ενημέρωση"
-            : "Έλεγχος ζωντανών πηγών",
+        isLive
+          ? updatesError
+            ? "Live-source retry in progress"
+            : updatesData
+              ? "No current live item returned"
+              : "Checking live sources"
+          : "No dated incident item yet",
+        isLive
+          ? updatesError
+            ? "Νέα προσπάθεια σύνδεσης με ζωντανές πηγές"
+            : updatesData
+              ? "Δεν επιστράφηκε τρέχουσα ζωντανή ενημέρωση"
+              : "Έλεγχος ζωντανών πηγών"
+          : "Δεν υπάρχει ακόμη χρονολογημένη καταχώριση συμβάντος",
       ),
       detail: localize(
         language,
-        "No archived chronology item is selected by default. Dated archive entries remain available in the list while current sources are checked.",
-        "Δεν επιλέγεται από προεπιλογή καταχώριση του αρχείου. Οι χρονολογημένες αρχειακές καταχωρίσεις παραμένουν διαθέσιμες στη λίστα όσο ελέγχονται οι τρέχουσες πηγές.",
+        isLive
+          ? "Dated archive entries remain available while current sources are checked."
+          : "Items with unknown timestamps and observations after the selected time are withheld.",
+        isLive
+          ? "Οι χρονολογημένες αρχειακές καταχωρίσεις παραμένουν διαθέσιμες όσο ελέγχονται οι τρέχουσες πηγές."
+          : "Οι καταχωρίσεις με άγνωστη ώρα και οι παρατηρήσεις μετά την επιλεγμένη στιγμή αποκρύπτονται.",
       ),
       confidence: "reported" as const,
-      live: true,
+      live: isLive,
     };
   const fireWind =
     windData?.locations.find((location) => location.id === "fire")?.current ??
@@ -1018,15 +1108,24 @@ export default function Home() {
   const retrievedTime = formatGreeceTime(windData?.generatedAt);
   const incidentThermalDetections = useMemo(
     () =>
-      thermalData?.detections.filter(
-        (detection) => detection.scope === "incident",
-      ) ?? [],
-    [thermalData],
+      filterAtOrBefore(
+        thermalData?.detections.filter(
+          (detection) => detection.scope === "incident",
+        ) ?? [],
+        (detection) => detection.observedAt,
+        asOfSelection,
+      ),
+    [asOfSelection, thermalData],
   );
   const latestIncidentPass = useMemo(
     () =>
-      thermalData?.passes.find((pass) => pass.incidentRecordCount > 0) ?? null,
-    [thermalData],
+      latestAtOrBefore(
+        thermalData?.passes.filter((pass) => pass.incidentRecordCount > 0) ??
+          [],
+        (pass) => pass.observedAt,
+        asOfSelection,
+      ),
+    [asOfSelection, thermalData],
   );
   const thermalDetections = useMemo(() => {
     if (thermalWindow === "latest") {
@@ -1035,15 +1134,14 @@ export default function Home() {
         (detection) => detection.passId === latestIncidentPass.id,
       );
     }
-    if (thermalWindow === "6h") {
-      return incidentThermalDetections.filter(
-        (detection) =>
-          (ageMinutesFromTimestamp(detection.observedAt, ageEpoch) ??
-            detection.ageMinutes) <= 360,
+    const windowMs = thermalWindow === "6h" ? 6 * 60 * 60_000 : 24 * 60 * 60_000;
+    return incidentThermalDetections.filter((detection) => {
+      const observedEpoch = timestampEpoch(detection.observedAt);
+      return (
+        observedEpoch !== null && observedEpoch >= effectiveEpoch - windowMs
       );
-    }
-    return incidentThermalDetections;
-  }, [ageEpoch, incidentThermalDetections, latestIncidentPass, thermalWindow]);
+    });
+  }, [effectiveEpoch, incidentThermalDetections, latestIncidentPass, thermalWindow]);
   const visibleThermalPasses = useMemo(
     () => new Set(thermalDetections.map((detection) => detection.passId)).size,
     [thermalDetections],
@@ -1055,15 +1153,21 @@ export default function Home() {
   const thermalStaleSnapshot =
     thermalError && Boolean(thermalData) && !thermalUnavailable;
   const thermalLoading = !thermalData && !thermalError;
+  const thermalLatestDetection = latestAtOrBefore(
+    incidentThermalDetections,
+    (detection) => detection.observedAt,
+    LIVE_AS_OF,
+  );
+  const thermalLatestObservedAt = thermalLatestDetection?.observedAt ?? null;
   const thermalLatestTime = formatGreeceDateTime(
-    thermalData?.latestIncidentObservedAt,
+    thermalLatestObservedAt,
     language,
   );
   const thermalLatestAge = ageLabel(
     ageMinutesFromTimestamp(
-      thermalData?.latestIncidentObservedAt,
-      ageEpoch,
-    ) ?? thermalData?.observationAgeMinutes,
+      thermalLatestObservedAt,
+      effectiveEpoch,
+    ),
     language,
   );
   const thermalRetrievedTime = formatGreeceDateTime(
@@ -1071,10 +1175,32 @@ export default function Home() {
     language,
   );
   const updatesRetrievedTime = formatGreeceTime(updatesData?.retrievedAt);
-  const sourceHealth = updatesData?.sourceSummary;
-  const thermalLayerDetail = thermalLoading
-    ? localize(language, "Loading FIRMS point feed", "Φόρτωση σημειακής ροής FIRMS")
-    : thermalUnavailable
+  const sourceHealth = isLive ? updatesData?.sourceSummary : null;
+  const thermalLayerDetail = !isLive
+    ? thermalLoading
+      ? localize(
+          language,
+          "Loading available thermal response",
+          "Φόρτωση διαθέσιμης θερμικής απόκρισης",
+        )
+      : thermalUnavailable
+        ? localize(
+            language,
+            "No thermal response available for replay",
+            "Δεν υπάρχει θερμική απόκριση για αναπαραγωγή",
+          )
+        : localize(
+            language,
+            `Observation time ≤ ${asOfLabel}`,
+            `Χρόνος παρατήρησης ≤ ${asOfLabel}`,
+          )
+    : thermalLoading
+      ? localize(
+          language,
+          "Loading FIRMS point feed",
+          "Φόρτωση σημειακής ροής FIRMS",
+        )
+      : thermalUnavailable
       ? localize(
           language,
           "FIRMS point feed unavailable",
@@ -1423,42 +1549,44 @@ export default function Home() {
         }),
       }).addTo(group);
 
-      L.polyline([PLOMARI_BEACH, AGIOS_ISIDOROS], {
-        color: "#55ddff",
-        weight: 8,
-        opacity: 0.18,
-        lineCap: "round",
-      }).addTo(group);
-      L.polyline([PLOMARI_BEACH, AGIOS_ISIDOROS], {
-        color: "#55ddff",
-        weight: 3,
-        opacity: 0.95,
-        dashArray: "10 8",
-      })
-        .bindTooltip(
-          localize(
-            language,
-            "16:58 official 112 direction: Plomari beach → Agios Isidoros · historical alert, verify any newer instruction",
-            "Επίσημη κατεύθυνση 112 στις 16:58: παραλία Πλωμαρίου → Άγιος Ισίδωρος · ιστορική ειδοποίηση, ελέγξτε κάθε νεότερη οδηγία",
-          ),
-          { sticky: true },
-        )
-        .addTo(group);
-      L.marker(midpoint(PLOMARI_BEACH, AGIOS_ISIDOROS), {
-        interactive: false,
-        icon: L.divIcon({
-          className: "marker-shell route-arrow-shell",
-          html: markerHtml(
-            "arrow",
-            localize(language, "112 · 16:58 →", "112 · 16:58 →"),
-          ),
-          iconSize: [130, 30],
-          iconAnchor: [18, 15],
-        }),
-      }).addTo(group);
+      if (showArchivedOfficialAlert) {
+        L.polyline([PLOMARI_BEACH, AGIOS_ISIDOROS], {
+          color: "#55ddff",
+          weight: 8,
+          opacity: 0.18,
+          lineCap: "round",
+        }).addTo(group);
+        L.polyline([PLOMARI_BEACH, AGIOS_ISIDOROS], {
+          color: "#55ddff",
+          weight: 3,
+          opacity: 0.95,
+          dashArray: "10 8",
+        })
+          .bindTooltip(
+            localize(
+              language,
+              "16:58 official 112 direction: Plomari beach → Agios Isidoros · historical alert, verify any newer instruction",
+              "Επίσημη κατεύθυνση 112 στις 16:58: παραλία Πλωμαρίου → Άγιος Ισίδωρος · ιστορική ειδοποίηση, ελέγξτε κάθε νεότερη οδηγία",
+            ),
+            { sticky: true },
+          )
+          .addTo(group);
+        L.marker(midpoint(PLOMARI_BEACH, AGIOS_ISIDOROS), {
+          interactive: false,
+          icon: L.divIcon({
+            className: "marker-shell route-arrow-shell",
+            html: markerHtml(
+              "arrow",
+              localize(language, "112 · 16:58 →", "112 · 16:58 →"),
+            ),
+            iconSize: [130, 30],
+            iconAnchor: [18, 15],
+          }),
+        }).addTo(group);
+      }
     }
 
-    if (layers.satelliteRaster) {
+    if (layers.satelliteRaster && isLive) {
       const thermalDate = utcDate(satelliteEpoch);
       [
         "VIIRS_NOAA20_Thermal_Anomalies_375m_All",
@@ -1551,7 +1679,7 @@ export default function Home() {
               "Greece time",
               "ώρα Ελλάδας",
             )} · ${ageLabel(
-              ageMinutesFromTimestamp(detection.observedAt, ageEpoch) ??
+              ageMinutesFromTimestamp(detection.observedAt, effectiveEpoch) ??
                 detection.ageMinutes,
               language,
             )}<br>${localize(
@@ -1572,7 +1700,7 @@ export default function Home() {
       });
     }
 
-    if (layers.local) {
+    if (layers.local && showFieldReport) {
       [AGIOS_ANTONIOS, midpoint(AGIOS_ANTONIOS, MEGALOCHORI)].forEach(
         (point, index) => {
           L.circle(point, {
@@ -1623,7 +1751,7 @@ export default function Home() {
       }).addTo(group);
     }
 
-    if (layers.wind) {
+    if (layers.wind && isLive) {
       const windVectors = [
         { label: "10 m", vector: fireWind.wind10, length: 2, opacity: 1 },
         { label: "80 m", vector: fireWind.wind80, length: 2.4, opacity: 0.72 },
@@ -1696,7 +1824,7 @@ export default function Home() {
       }
     }
 
-    if (layers.smokeObserved) {
+    if (layers.smokeObserved && isLive) {
       L.tileLayer
         .wms(
           "https://gibs.earthdata.nasa.gov/wms/epsg3857/nrt/wms.cgi",
@@ -1723,7 +1851,7 @@ export default function Home() {
         .addTo(group);
     }
 
-    if (layers.smoke) {
+    if (layers.smoke && isLive) {
       const outer = scenarioShape(
         INCIDENT,
         downwindHeading,
@@ -1805,7 +1933,10 @@ export default function Home() {
     smokeMinutes,
     satelliteEpoch,
     thermalDetections,
-    ageEpoch,
+    effectiveEpoch,
+    isLive,
+    showArchivedOfficialAlert,
+    showFieldReport,
     language,
   ]);
 
@@ -1835,7 +1966,7 @@ export default function Home() {
 
   return (
     <main
-      className={`command-shell${mobileSheetOpen ? " has-mobile-sheet" : ""}${layers.simulation ? " has-scenario" : ""}`}
+      className={`command-shell${mobileSheetOpen ? " has-mobile-sheet" : ""}${layers.simulation ? " has-scenario" : ""}${isLive ? " is-live" : " is-historical"}${isScrubbing ? " is-scrubbing" : ""}${showArchivedOfficialAlert ? "" : " without-archived-alert"}`}
     >
       <div className="map-stage">
         <div
@@ -1871,7 +2002,10 @@ export default function Home() {
       <header className="top-hud">
         <div className="brand-lockup">
           <div className="brand-line">
-            <span className="live-dot" aria-hidden="true" />
+            <span
+              className={`live-dot${isLive ? "" : " live-dot--historical"}`}
+              aria-hidden="true"
+            />
             <h1>FIREWATCH // PLOMARI</h1>
           </div>
           <p>
@@ -1884,9 +2018,9 @@ export default function Home() {
         </div>
 
         <div className="classification">
-          {localize(language, "FIRE SERVICE", "ΠΥΡΟΣΒΕΣΤΙΚΟ ΣΩΜΑ")}
-          {" // "}
-          {officialStatus}
+          {isLive
+            ? `${localize(language, "FIRE SERVICE", "ΠΥΡΟΣΒΕΣΤΙΚΟ ΣΩΜΑ")} // ${officialStatus}`
+            : `${localize(language, "HISTORICAL VIEW", "ΙΣΤΟΡΙΚΗ ΠΡΟΒΟΛΗ")} // ${asOfLabel}`}
         </div>
 
         <div className="clock-block">
@@ -1927,14 +2061,90 @@ export default function Home() {
           <small>
             {localize(
               language,
-              "FIRE BOARD AUTO · 112 MANUAL",
-              "ΑΥΤΟΜΑΤΗ ΕΝΗΜΕΡΩΣΗ Π.Σ. · ΧΕΙΡΟΚΙΝΗΤΗ ΕΠΑΛΗΘΕΥΣΗ 112",
+              isLive
+                ? "FIRE BOARD AUTO · 112 MANUAL"
+                : "CLOCK IS CURRENT · MAP IS HISTORICAL",
+              isLive
+                ? "ΑΥΤΟΜΑΤΗ ΕΝΗΜΕΡΩΣΗ Π.Σ. · ΧΕΙΡΟΚΙΝΗΤΗ ΕΠΑΛΗΘΕΥΣΗ 112"
+                : "ΤΡΕΧΟΝ ΡΟΛΟΪ · ΙΣΤΟΡΙΚΟΣ ΧΑΡΤΗΣ",
             )}
           </small>
         </div>
       </header>
 
       <section
+        className="time-scrubber"
+        aria-label={localize(
+          language,
+          "Global incident time",
+          "Καθολικός χρόνος συμβάντος",
+        )}
+      >
+        <div className="time-scrubber__meta">
+          <span>
+            {localize(language, "GLOBAL AS OF", "ΚΑΘΟΛΙΚΗ ΧΡΟΝΙΚΗ ΣΤΙΓΜΗ")}
+          </span>
+          <strong>
+            {isLive
+              ? localize(language, "LIVE // NOW", "ΖΩΝΤΑΝΑ // ΤΩΡΑ")
+              : `${localize(language, "AS OF", "ΕΩΣ")} ${asOfLabel}`}
+          </strong>
+        </div>
+        <label className="time-scrubber__range">
+          <span className="sr-only">
+            {localize(
+              language,
+              "Show incident data as of a selected time",
+              "Προβολή δεδομένων συμβάντος έως επιλεγμένη ώρα",
+            )}
+          </span>
+          <input
+            type="range"
+            min={INCIDENT_STARTED_EPOCH}
+            max={ageEpoch}
+            step={15 * 60_000}
+            value={asOfEpoch ?? ageEpoch}
+            suppressHydrationWarning
+            aria-valuetext={
+              isLive
+                ? localize(language, "Live, current time", "Ζωντανά, τρέχουσα ώρα")
+                : `${localize(language, "As of", "Έως")} ${asOfLabel}`
+            }
+            onChange={(event) =>
+              setAsOfEpoch(
+                clampAsOfEpoch(
+                  Number(event.currentTarget.value),
+                  INCIDENT_STARTED_EPOCH,
+                  ageEpoch,
+                ),
+              )
+            }
+            onPointerDown={() => setIsScrubbing(true)}
+            onPointerUp={() => setIsScrubbing(false)}
+            onPointerCancel={() => setIsScrubbing(false)}
+            onKeyDown={() => setIsScrubbing(true)}
+            onKeyUp={() => setIsScrubbing(false)}
+            onBlur={() => setIsScrubbing(false)}
+          />
+          <span className="time-scrubber__bounds">
+            <small>
+              {localize(language, "START", "ΕΝΑΡΞΗ")} ·{" "}
+              {formatGreeceDateTime(INCIDENT_STARTED_AT, language)}
+            </small>
+            <small>{localize(language, "NOW", "ΤΩΡΑ")}</small>
+          </span>
+        </label>
+        <button
+          type="button"
+          className={isLive ? "is-active" : ""}
+          onClick={() => setAsOfEpoch(null)}
+          aria-pressed={isLive}
+        >
+          {localize(language, "LIVE", "ΖΩΝΤΑΝΑ")}
+        </button>
+      </section>
+
+      {showArchivedOfficialAlert && <section
         className="evacuation-banner"
         aria-label={localize(
           language,
@@ -1975,8 +2185,12 @@ export default function Home() {
           <span className="evacuation-caveat">
             {localize(
               language,
-              `Original alert issued 16:58 · last manual record review ${officialVerifiedTime === "—" ? "pending" : officialVerifiedTime}. This banner reproduces that instruction; it is not proof that it remains current. Follow any newer 112 message and authorities on the ground.`,
-              `Η αρχική ειδοποίηση εκδόθηκε στις 16:58 · τελευταίος χειροκίνητος έλεγχος αρχείου ${officialVerifiedTime === "—" ? "εκκρεμεί" : `στις ${officialVerifiedTime}`}. Το πλαίσιο αναπαράγει εκείνη την οδηγία· δεν αποδεικνύει ότι παραμένει σε ισχύ. Ακολουθείτε κάθε νεότερο μήνυμα 112 και τις επί τόπου οδηγίες των Αρχών.`,
+              isLive
+                ? `Original alert issued 16:58 · last manual record review ${officialVerifiedTime === "—" ? "pending" : officialVerifiedTime}. This banner reproduces that instruction; it is not proof that it remains current. Follow any newer 112 message and authorities on the ground.`
+                : "Original alert issued 16:58. It is shown because its source time is at or before the selected time; no later verification is imported into this view.",
+              isLive
+                ? `Η αρχική ειδοποίηση εκδόθηκε στις 16:58 · τελευταίος χειροκίνητος έλεγχος αρχείου ${officialVerifiedTime === "—" ? "εκκρεμεί" : `στις ${officialVerifiedTime}`}. Το πλαίσιο αναπαράγει εκείνη την οδηγία· δεν αποδεικνύει ότι παραμένει σε ισχύ. Ακολουθείτε κάθε νεότερο μήνυμα 112 και τις επί τόπου οδηγίες των Αρχών.`
+                : "Η αρχική ειδοποίηση εκδόθηκε στις 16:58. Εμφανίζεται επειδή ο χρόνος πηγής είναι έως την επιλεγμένη στιγμή· δεν εισάγεται μεταγενέστερη επαλήθευση.",
             )}{" "}
             <a
               className="official-alert-link"
@@ -1997,7 +2211,7 @@ export default function Home() {
           <span>{localize(language, "CALL", "ΚΛΗΣΗ")}</span>
           <b>112</b>
         </a>
-      </section>
+      </section>}
 
       <nav
         className="view-controls"
@@ -2099,10 +2313,14 @@ export default function Home() {
                 ),
                 detail: localize(
                   language,
-                  "Original official alert · 16:58",
-                  "Αρχική επίσημη ειδοποίηση · 16:58",
+                  showArchivedOfficialAlert
+                    ? "Original official alert · 16:58"
+                    : "Incident reference · 112 not yet issued",
+                  showArchivedOfficialAlert
+                    ? "Αρχική επίσημη ειδοποίηση · 16:58"
+                    : "Σημείο συμβάντος · το 112 δεν είχε εκδοθεί",
                 ),
-                count: "1",
+                count: showArchivedOfficialAlert ? "1" : "—",
               },
               {
                 key: "satellite" as LayerKey,
@@ -2128,10 +2346,14 @@ export default function Home() {
                 ),
                 detail: localize(
                   language,
-                  "NASA GIBS imagery · not extra points",
-                  "Εικόνα NASA GIBS · όχι πρόσθετα σημεία",
+                  isLive
+                    ? "NASA GIBS imagery · not extra points"
+                    : "Current-only daily composite · hidden",
+                  isLive
+                    ? "Εικόνα NASA GIBS · όχι πρόσθετα σημεία"
+                    : "Τρέχον ημερήσιο σύνθετο · κρυφό",
                 ),
-                count: "IMG",
+                count: isLive ? "IMG" : "LIVE",
               },
               {
                 key: "local" as LayerKey,
@@ -2143,10 +2365,14 @@ export default function Home() {
                 ),
                 detail: localize(
                   language,
-                  "1 report · 2 reference areas · 20:50",
-                  "1 αναφορά · 2 περιοχές αναφοράς · 20:50",
+                  showFieldReport
+                    ? "1 report · 2 reference areas · 20:50"
+                    : "No eligible field area yet · report at 20:50",
+                  showFieldReport
+                    ? "1 αναφορά · 2 περιοχές αναφοράς · 20:50"
+                    : "Καμία επιλέξιμη περιοχή ακόμη · αναφορά στις 20:50",
                 ),
-                count: "1R/2A",
+                count: showFieldReport ? "1R/2A" : "—",
               },
               {
                 key: "wind" as LayerKey,
@@ -2158,10 +2384,14 @@ export default function Home() {
                 ),
                 detail: localize(
                   language,
-                  `Model valid ${windObservedTime} · polls 5 min`,
-                  `Μοντέλο για ${windObservedTime} · ενημέρωση κάθε 5 λεπτά`,
+                  isLive
+                    ? `Model valid ${windObservedTime} · polls 5 min`
+                    : "Current-only model · hidden in history",
+                  isLive
+                    ? `Μοντέλο για ${windObservedTime} · ενημέρωση κάθε 5 λεπτά`
+                    : "Μόνο τρέχον μοντέλο · κρυφό στο ιστορικό",
                 ),
-                count: "4",
+                count: isLive ? "4" : "LIVE",
               },
               {
                 key: "smokeObserved" as LayerKey,
@@ -2173,10 +2403,14 @@ export default function Home() {
                 ),
                 detail: localize(
                   language,
-                  "NASA VIIRS NRT · daylight snapshot",
-                  "NASA VIIRS NRT · ημερήσιο στιγμιότυπο",
+                  isLive
+                    ? "NASA VIIRS NRT · daylight snapshot"
+                    : "Current-only daily composite · hidden",
+                  isLive
+                    ? "NASA VIIRS NRT · ημερήσιο στιγμιότυπο"
+                    : "Τρέχον ημερήσιο σύνθετο · κρυφό",
                 ),
-                count: "NRT",
+                count: isLive ? "NRT" : "LIVE",
               },
               {
                 key: "smoke" as LayerKey,
@@ -2188,10 +2422,14 @@ export default function Home() {
                 ),
                 detail: localize(
                   language,
-                  "Modeled wind envelope · not PM2.5",
-                  "Μοντελοποιημένη ζώνη ανέμου · όχι μέτρηση PM2.5",
+                  isLive
+                    ? "Modeled wind envelope · not PM2.5"
+                    : "Depends on current wind · hidden",
+                  isLive
+                    ? "Μοντελοποιημένη ζώνη ανέμου · όχι μέτρηση PM2.5"
+                    : "Βασίζεται στον τρέχοντα άνεμο · κρυφή",
                 ),
-                count: `${smokeMinutes}m`,
+                count: isLive ? `${smokeMinutes}m` : "LIVE",
               },
               {
                 key: "simulation" as LayerKey,
@@ -2208,25 +2446,30 @@ export default function Home() {
                 ),
                 count: "SIM",
               },
-            ].map((layer) => (
-              <button
-                type="button"
-                className={`layer-control ${layers[layer.key] ? "is-enabled" : ""}`}
-                key={layer.key}
-                onClick={() => toggleLayer(layer.key)}
-                aria-pressed={layers[layer.key]}
-              >
-                <span className="layer-icon">{layer.icon}</span>
-                <span className="layer-copy">
-                  <strong>{layer.label}</strong>
-                  <small>{layer.detail}</small>
-                </span>
-                <span className="layer-count">{layer.count}</span>
-                <span className="switch" aria-hidden="true">
-                  <i />
-                </span>
-              </button>
-            ))}
+            ].map((layer) => {
+              const currentOnly =
+                !isLive && CURRENT_ONLY_LAYER_KEYS.has(layer.key);
+              return (
+                <button
+                  type="button"
+                  className={`layer-control${layers[layer.key] && !currentOnly ? " is-enabled" : ""}${currentOnly ? " is-current-only" : ""}`}
+                  key={layer.key}
+                  onClick={() => toggleLayer(layer.key)}
+                  aria-pressed={currentOnly ? false : layers[layer.key]}
+                  disabled={currentOnly}
+                >
+                  <span className="layer-icon">{layer.icon}</span>
+                  <span className="layer-copy">
+                    <strong>{layer.label}</strong>
+                    <small>{layer.detail}</small>
+                  </span>
+                  <span className="layer-count">{layer.count}</span>
+                  <span className="switch" aria-hidden="true">
+                    <i />
+                  </span>
+                </button>
+              );
+            })}
           </div>
 
           <section
@@ -2249,8 +2492,9 @@ export default function Home() {
                 className={
                   thermalUnavailable
                     ? "is-error"
-                    : thermalData?.status === "partial" ||
-                        thermalStaleSnapshot
+                    : isLive &&
+                        (thermalData?.status === "partial" ||
+                          thermalStaleSnapshot)
                       ? "is-partial"
                       : ""
                 }
@@ -2259,6 +2503,8 @@ export default function Home() {
                   ? localize(language, "LOADING", "ΦΟΡΤΩΣΗ")
                   : thermalUnavailable
                     ? localize(language, "UNAVAILABLE", "ΜΗ ΔΙΑΘΕΣΙΜΗ")
+                    : !isLive
+                      ? localize(language, "AS-OF FILTER", "ΦΙΛΤΡΟ ΕΩΣ")
                     : thermalStaleSnapshot
                       ? localize(language, "RETRYING", "ΝΕΑ ΠΡΟΣΠΑΘΕΙΑ")
                     : thermalData?.status === "partial"
@@ -2399,12 +2645,14 @@ export default function Home() {
               )}
             </p>
             <small className="thermal-source-line">
-              {localize(language, "Retrieved", "Ανάκτηση")}{" "}
-              {thermalRetrievedTime} ·{" "}
               {localize(
                 language,
-                "app checks every 5 min; satellite passes are not continuous",
-                "έλεγχος εφαρμογής κάθε 5 λεπτά· οι δορυφορικές διελεύσεις δεν είναι συνεχείς",
+                isLive
+                  ? `Retrieved ${thermalRetrievedTime} · app checks every 5 min; satellite passes are not continuous`
+                  : `Available response retrieved ${thermalRetrievedTime} · filtered by observation time; a complete historical archive is not guaranteed`,
+                isLive
+                  ? `Ανάκτηση ${thermalRetrievedTime} · έλεγχος εφαρμογής κάθε 5 λεπτά· οι δορυφορικές διελεύσεις δεν είναι συνεχείς`
+                  : `Διαθέσιμη απόκριση με ανάκτηση ${thermalRetrievedTime} · φιλτράρεται με βάση τον χρόνο παρατήρησης· δεν διασφαλίζεται πλήρες ιστορικό αρχείο`,
               )}
             </small>
           </section>
@@ -2421,8 +2669,10 @@ export default function Home() {
             </button>
           </div>
 
-          <div className="wind-readout">
-            <div className="wind-readout__head">
+          <div className={`wind-readout${isLive ? "" : " wind-readout--withheld"}`}>
+            {isLive ? (
+              <>
+                <div className="wind-readout__head">
               <span>
                 {localize(
                   language,
@@ -2518,7 +2768,26 @@ export default function Home() {
                   retrievedTime === "—" ? "εκκρεμεί" : `${retrievedTime} ώρα Ελλάδας`
                 }.`,
               )}
-            </p>
+                </p>
+              </>
+            ) : (
+              <div className="current-only-notice">
+                <strong>
+                  {localize(
+                    language,
+                    "CURRENT-ONLY WIND WITHHELD",
+                    "ΑΠΟΚΡΥΨΗ ΤΡΕΧΟΝΤΟΣ ΑΝΕΜΟΥ",
+                  )}
+                </strong>
+                <p>
+                  {localize(
+                    language,
+                    "This endpoint returns the latest model and airport observation, not a historical series. Return to Live to view it.",
+                    "Αυτή η πηγή επιστρέφει το νεότερο μοντέλο και την παρατήρηση αεροδρομίου, όχι ιστορική σειρά. Επιστρέψτε στη ζωντανή προβολή.",
+                  )}
+                </p>
+              </div>
+            )}
           </div>
         </aside>
       )}
@@ -2602,24 +2871,38 @@ export default function Home() {
                 {localize(language, "INCIDENT WIRE", "ΡΟΗ ΣΥΜΒΑΝΤΟΣ")}
               </span>
               <small>
-                {localize(language, "GREECE TIME", "ΩΡΑ ΕΛΛΑΔΑΣ")}
-                {" // "}
-                {updatesError
-                  ? localize(
-                      language,
-                      "SNAPSHOT · RETRYING",
-                      "ΣΤΙΓΜΙΟΤΥΠΟ · ΝΕΑ ΠΡΟΣΠΑΘΕΙΑ",
-                    )
-                  : localize(
-                      language,
-                      `RSS POLL ${updatesRetrievedTime}`,
-                      `ΕΛΕΓΧΟΣ RSS ${updatesRetrievedTime}`,
-                    )}
+                {isLive ? (
+                  <>
+                    {localize(language, "GREECE TIME", "ΩΡΑ ΕΛΛΑΔΑΣ")}
+                    {" // "}
+                    {updatesError
+                      ? localize(
+                          language,
+                          "SNAPSHOT · RETRYING",
+                          "ΣΤΙΓΜΙΟΤΥΠΟ · ΝΕΑ ΠΡΟΣΠΑΘΕΙΑ",
+                        )
+                      : localize(
+                          language,
+                          `RSS POLL ${updatesRetrievedTime}`,
+                          `ΕΛΕΓΧΟΣ RSS ${updatesRetrievedTime}`,
+                        )}
+                  </>
+                ) : (
+                  localize(
+                    language,
+                    `DATED ITEMS ≤ ${asOfLabel}`,
+                    `ΧΡΟΝΟΛΟΓΗΜΕΝΑ ΣΤΟΙΧΕΙΑ ≤ ${asOfLabel}`,
+                  )
+                )}
               </small>
             </div>
             <div className="hud-heading__actions">
-              <span className="recording-dot">
-                {localize(language, "REC", "ΖΩΝΤΑΝΑ")}
+              <span
+                className={`recording-dot${isLive ? "" : " recording-dot--historical"}`}
+              >
+                {isLive
+                  ? localize(language, "REC", "ΖΩΝΤΑΝΑ")
+                  : localize(language, "AS OF", "ΕΩΣ")}
               </span>
               <button
                 type="button"
@@ -2641,7 +2924,7 @@ export default function Home() {
               <button
                 type="button"
                 key={item.id}
-                className={item.id === activeIntel ? "intel-item is-active" : "intel-item"}
+                className={item.id === active.id ? "intel-item is-active" : "intel-item"}
                 onClick={() => setActiveIntel(item.id)}
               >
                 <time>
@@ -2713,7 +2996,24 @@ export default function Home() {
             <span>
               {localize(language, "SOURCE HEALTH", "ΚΑΤΑΣΤΑΣΗ ΠΗΓΩΝ")}
             </span>
-            {sourceHealth ? (
+            {!isLive ? (
+              <>
+                <strong>
+                  {localize(
+                    language,
+                    "CURRENT-ONLY · NOT RECONSTRUCTED",
+                    "ΜΟΝΟ ΤΡΕΧΟΥΣΑ · ΔΕΝ ΑΝΑΚΑΤΑΣΚΕΥΑΖΕΤΑΙ",
+                  )}
+                </strong>
+                <small>
+                  {localize(
+                    language,
+                    "Source reachability reflects the latest poll, so it is withheld from historical view.",
+                    "Η προσβασιμότητα πηγών αφορά τον νεότερο έλεγχο και αποκρύπτεται από την ιστορική προβολή.",
+                  )}
+                </small>
+              </>
+            ) : sourceHealth ? (
               <strong>
                 {sourceHealth.online}/{sourceHealth.total}{" "}
                 {localize(language, "reachable", "προσβάσιμες")}
@@ -2727,13 +3027,15 @@ export default function Home() {
             ) : (
               <strong>{localize(language, "CHECKING", "ΕΛΕΓΧΟΣ")}</strong>
             )}
-            <small>
-              {localize(
-                language,
-                "Reachable means the source responded—not that it published a new Plomari update.",
-                "Προσβάσιμη σημαίνει ότι η πηγή ανταποκρίθηκε—όχι ότι δημοσίευσε νέα ενημέρωση για το Πλωμάρι.",
-              )}
-            </small>
+            {isLive && (
+              <small>
+                {localize(
+                  language,
+                  "Reachable means the source responded—not that it published a new Plomari update.",
+                  "Προσβάσιμη σημαίνει ότι η πηγή ανταποκρίθηκε—όχι ότι δημοσίευσε νέα ενημέρωση για το Πλωμάρι.",
+                )}
+              </small>
+            )}
           </div>
 
           <div className="source-links">
@@ -2800,7 +3102,10 @@ export default function Home() {
               max="7"
               step="1"
               value={beaufort}
-              onChange={(event) => setBeaufort(Number(event.target.value))}
+              onChange={(event) => {
+                const value = Number(event.target.value);
+                if (isBeaufort(value)) setBeaufort(value);
+              }}
             />
           </label>
           <label>
@@ -2812,8 +3117,10 @@ export default function Home() {
               <option value="218">
                 {localize(
                   language,
-                  "SW · modeled downwind",
-                  "ΝΔ · μοντελοποιημένη υπήνεμη κατεύθυνση",
+                  isLive ? "SW · modeled downwind" : "SW · scenario heading",
+                  isLive
+                    ? "ΝΔ · μοντελοποιημένη υπήνεμη κατεύθυνση"
+                    : "ΝΔ · κατεύθυνση σεναρίου",
                 )}
               </option>
               <option value="180">
@@ -2844,20 +3151,36 @@ export default function Home() {
         className="mission-hud"
         aria-label={localize(
           language,
-          "Current operating picture",
-          "Τρέχουσα επιχειρησιακή εικόνα",
+          isLive ? "Current operating picture" : "Historical operating picture",
+          isLive
+            ? "Τρέχουσα επιχειρησιακή εικόνα"
+            : "Ιστορική επιχειρησιακή εικόνα",
         )}
       >
         <div className="mission-primary">
           <span>
-            {localize(language, "OFFICIAL STATUS", "ΕΠΙΣΗΜΗ ΚΑΤΑΣΤΑΣΗ")}
+            {localize(
+              language,
+              isLive ? "OFFICIAL STATUS" : "OFFICIAL STATUS · CURRENT-ONLY",
+              isLive
+                ? "ΕΠΙΣΗΜΗ ΚΑΤΑΣΤΑΣΗ"
+                : "ΕΠΙΣΗΜΗ ΚΑΤΑΣΤΑΣΗ · ΜΟΝΟ ΤΡΕΧΟΥΣΑ",
+            )}
           </span>
-          <strong>{officialStatus}</strong>
+          <strong>
+            {isLive
+              ? officialStatus
+              : localize(language, "NOT RECONSTRUCTED", "ΔΕΝ ΑΝΑΚΑΤΑΣΚΕΥΑΖΕΤΑΙ")}
+          </strong>
           <small>
             {localize(
               language,
-              "Fire Service auto · latest 112 instruction remains manual",
-              "Αυτόματη ενημέρωση Π.Σ. · χειροκίνητη επαλήθευση τελευταίας οδηγίας 112",
+              isLive
+                ? "Fire Service auto · latest 112 instruction remains manual"
+                : "Latest Fire Service board state is withheld from history",
+              isLive
+                ? "Αυτόματη ενημέρωση Π.Σ. · χειροκίνητη επαλήθευση τελευταίας οδηγίας 112"
+                : "Η νεότερη κατάσταση του πίνακα Π.Σ. αποκρύπτεται από το ιστορικό",
             )}
           </small>
         </div>
@@ -2905,50 +3228,68 @@ export default function Home() {
           <span>
             {localize(
               language,
-              "FIRE-GRID MODEL",
-              "ΜΟΝΤΕΛΟ ΑΝΕΜΟΥ ΣΤΗΝ ΕΣΤΙΑ",
+              isLive ? "FIRE-GRID MODEL" : "FIRE-GRID MODEL · CURRENT-ONLY",
+              isLive
+                ? "ΜΟΝΤΕΛΟ ΑΝΕΜΟΥ ΣΤΗΝ ΕΣΤΙΑ"
+                : "ΜΟΝΤΕΛΟ ΑΝΕΜΟΥ · ΜΟΝΟ ΤΡΕΧΟΝ",
             )}{" "}
-            · {windObservedTime}
+            {isLive ? `· ${windObservedTime}` : ""}
           </span>
           <strong>
-            {compass(fireWind.wind10.directionDeg, language)} →{" "}
-            {compass(downwindHeading, language)} ·{" "}
-            {fireWind.wind10.speedKmh.toFixed(0)} km/h
+            {isLive
+              ? `${compass(fireWind.wind10.directionDeg, language)} → ${compass(downwindHeading, language)} · ${fireWind.wind10.speedKmh.toFixed(0)} km/h`
+              : localize(language, "NOT RECONSTRUCTED", "ΔΕΝ ΑΝΑΚΑΤΑΣΚΕΥΑΖΕΤΑΙ")}
           </strong>
           <small>
-            {localize(language, "Gust", "Ριπή")}{" "}
-            {fireWind.gustKmh.toFixed(0)} km/h ·{" "}
-            {localize(language, "model, not sensor", "μοντέλο, όχι αισθητήρας")}
+            {isLive
+              ? `${localize(language, "Gust", "Ριπή")} ${fireWind.gustKmh.toFixed(0)} km/h · ${localize(language, "model, not sensor", "μοντέλο, όχι αισθητήρας")}`
+              : localize(
+                  language,
+                  "Latest-only endpoint withheld",
+                  "Απόκρυψη πηγής που δίνει μόνο την τελευταία τιμή",
+                )}
           </small>
         </div>
         <div>
           <span>
-            {localize(language, "INCIDENT WIRE", "ΡΟΗ ΣΥΜΒΑΝΤΟΣ")} ·{" "}
-            {updatesRetrievedTime}
+            {localize(language, "INCIDENT WIRE", "ΡΟΗ ΣΥΜΒΑΝΤΟΣ")}
+            {isLive ? ` · ${updatesRetrievedTime}` : ` · ${asOfLabel}`}
           </span>
           <strong>
-            {updatesError
+            {!isLive
               ? localize(
                   language,
-                  "SNAPSHOT / RETRYING",
-                  "ΣΤΙΓΜΙΟΤΥΠΟ / ΝΕΑ ΠΡΟΣΠΑΘΕΙΑ",
+                  "DATED ITEMS ONLY",
+                  "ΜΟΝΟ ΧΡΟΝΟΛΟΓΗΜΕΝΑ ΣΤΟΙΧΕΙΑ",
+                )
+              : updatesError
+                ? localize(
+                    language,
+                    "SNAPSHOT / RETRYING",
+                    "ΣΤΙΓΜΙΟΤΥΠΟ / ΝΕΑ ΠΡΟΣΠΑΘΕΙΑ",
+                  )
+                : localize(
+                    language,
+                    "POLLING 60 SECONDS",
+                    "ΕΛΕΓΧΟΣ ΚΑΘΕ 60 ΔΕΥΤΕΡΟΛΕΠΤΑ",
+                  )}
+          </strong>
+          <small>
+            {!isLive
+              ? localize(
+                  language,
+                  "Unknown and later timestamps withheld",
+                  "Απόκρυψη άγνωστων και μεταγενέστερων χρόνων",
                 )
               : localize(
                   language,
-                  "POLLING 60 SECONDS",
-                  "ΕΛΕΓΧΟΣ ΚΑΘΕ 60 ΔΕΥΤΕΡΟΛΕΠΤΑ",
+                  sourceHealth
+                    ? `${sourceHealth.online}/${sourceHealth.total} sources reachable · Greece timestamps`
+                    : "Checking official and local sources · Greece timestamps",
+                  sourceHealth
+                    ? `${sourceHealth.online}/${sourceHealth.total} πηγές προσβάσιμες · ώρες Ελλάδας`
+                    : "Έλεγχος επίσημων και τοπικών πηγών · ώρες Ελλάδας",
                 )}
-          </strong>
-          <small>
-            {localize(
-              language,
-              sourceHealth
-                ? `${sourceHealth.online}/${sourceHealth.total} sources reachable · Greece timestamps`
-                : "Checking official and local sources · Greece timestamps",
-              sourceHealth
-                ? `${sourceHealth.online}/${sourceHealth.total} πηγές προσβάσιμες · ώρες Ελλάδας`
-                : "Έλεγχος επίσημων και τοπικών πηγών · ώρες Ελλάδας",
-            )}
           </small>
         </div>
       </section>

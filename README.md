@@ -256,11 +256,17 @@ request-time API composition and into an append-only, auditable data layer.
 - [Truth contract versioning](docs/truth-contract-versioning.md) defines
   compatibility, identity, quarantine, and fixture policy.
 
-The CLI-generated [`supabase`](supabase) project contains the initial private
-PostGIS truth schema, access boundary, database tests, and seed catalog. The
-migration is local development work and has not been applied to the live
-Supabase project. Collection and read-model changes will run in shadow mode
-before the public map switches to a new read model.
+The CLI-generated [`supabase`](supabase) project contains the private PostGIS
+truth schema, access boundary, database tests, and disabled source catalog. The
+reviewed foundation is deployed to the live Supabase project, with only the
+curated `api` schema exposed. All sources and collection targets remain disabled
+while collection and read-model changes run in shadow mode; the public map has
+not switched to the new read model.
+
+`GET /api/v3/shadow/sources` is the first bounded server-side read of that
+catalog. It requires only `SUPABASE_URL` and `SUPABASE_PUBLISHABLE_KEY`, reads
+the curated `api` schema, and is deliberately not wired into the v2 map. Never
+substitute a service-role or secret key for this route.
 
 ## Supabase development
 
@@ -273,9 +279,9 @@ supabase test db
 ```
 
 `supabase/config.toml` exposes only the curated `api` schema through the local
-Data API. The `core`, `ingest`, and `truth` schemas are private. Use a separate
-non-production Supabase branch for the first hosted migration rehearsal; do not
-push an unreviewed migration directly to production.
+Data API. The `core`, `ingest`, and `truth` schemas are private. Rehearse later
+hosted migrations on a separate non-production Supabase branch; never push an
+unreviewed migration directly to production.
 
 The migration defines separate no-login capability roles for catalog work,
 collection, reconciliation, publication, and outbox delivery. It does not

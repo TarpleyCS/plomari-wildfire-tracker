@@ -15,6 +15,8 @@ function boardWithForestSection(content: string) {
 
 const PLOMARI_ROW_WITH_DATE =
   "<td>Δ. ΛΕΣΒΟΥ - ΠΛΩΜΑΡΙΟΥ</td><td>ΕΝΑΡΞΗ <b>29/07/2026</b></td>";
+const PLOMARI_ROW_WITH_NEW_DATE =
+  "<td>Δ. ΛΕΣΒΟΥ - ΠΛΩΜΑΡΙΟΥ</td><td>ΕΝΑΡΞΗ <b>30/07/2026</b></td>";
 const PLOMARI_ROW_WITHOUT_DATE =
   "<td>Δ. ΛΕΣΒΟΥ - ΠΛΩΜΑΡΙΟΥ</td><td></td><td></td>";
 
@@ -134,6 +136,27 @@ test("rejects ambiguous ended rows when the board omits their dates", () => {
       boardWithForestSection(`ΛΗΞΗ (2)${incident}${incident}`),
     ),
   ).toThrow(/Plomari incident signature not unique/);
+});
+
+test("prefers a unique new active row over the previous ended incident", () => {
+  const html = boardWithForestSection(
+    "ΛΗΞΗ (1)" +
+    '<div class="bg-info"><div class="panel-heading"><table><tr>' +
+    PLOMARI_ROW_WITH_DATE +
+    "</tr></table></div></div>" +
+    "ΣΕ ΕΞΕΛΙΞΗ (1)" +
+    '<div class="panel panel-red"><div class="panel-heading"><table><tr>' +
+    PLOMARI_ROW_WITH_NEW_DATE +
+    "</tr></table>Τελευταία Ενημέρωση πριν από 2 λεπτά</div></div>",
+  );
+
+  expect(parseFireServiceBoard(html)).toEqual({
+    status: "in-progress",
+    statusLabel: "IN PROGRESS",
+    municipality: "Lesvos · Plomari",
+    incidentType: "Wildfire incident",
+    sourceAge: "2 λεπτα",
+  });
 });
 
 test("replaces invalid numeric entities without throwing", () => {

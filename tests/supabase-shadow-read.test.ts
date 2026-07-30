@@ -1,0 +1,337 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { z } from "zod";
+
+import { GET } from "../app/api/v3/shadow/sources/route";
+import {
+  readPostgrestRows,
+  SupabasePostgrestReadError,
+} from "../lib/supabase/postgrest";
+import { sourceCatalogRowSchema } from "../lib/supabase/source-read-model";
+import {
+  readSupabaseServerEnvironment,
+  SupabaseServerConfigurationError,
+  type SupabaseServerEnvironment,
+} from "../lib/supabase/server-env";
+
+const TEST_ENVIRONMENT: SupabaseServerEnvironment = Object.freeze({
+  url: "https://project.supabase.co",
+  publishableKey: "test-publishable-key-1234",
+});
+
+const CATALOG_ROW = {
+  source_id: "018f0000-0000-7000-8000-000000000101",
+  contract_version: "1.1.0",
+  provider_id: "018f0000-0000-7000-8000-000000000001",
+  provider_contract_version: "1.1.0",
+  provider_slug: "nasa",
+  provider_name: "NASA",
+  slug: "nasa-firms",
+  name: "NASA FIRMS Active Fire Data",
+  description: "Satellite thermal detections.",
+  product_family: "active_fire",
+  default_trust_class: "official_observation",
+  default_evidence_class: "thermal_detection",
+  operational_scope: "mixed",
+  homepage_url: "https://firms.modaps.eosdis.nasa.gov/",
+  terms_url: null,
+  license_code: "provider_terms",
+  license_name: null,
+  attribution_text: null,
+  license_status: "unreviewed",
+  commercial_use_allowed: null,
+  redistribution_allowed: null,
+  default_freshness: "00:15:00",
+  default_max_staleness: "03:00:00",
+  enabled: false,
+  updated_at: "2026-07-30T00:00:00+00:00",
+} as const;
+
+const HEALTH_ROW = {
+  health_id: "018f0000-0000-7000-8000-000000000601",
+  source_id: CATALOG_ROW.source_id,
+  source_slug: CATALOG_ROW.slug,
+  collection_target_id: "018f0000-0000-7000-8000-000000000401",
+  collection_target_name: "FIRMS global discovery",
+  status: "healthy",
+  circuit_state: "closed",
+  checked_at: "2026-07-30T01:00:00+00:00",
+  last_success_at: "2026-07-30T00:59:00+00:00",
+  last_payload_changed_at: "2026-07-30T00:58:00+00:00",
+  latest_source_observed_at: "2026-07-30T00:57:00+00:00",
+  consecutive_failures: 0,
+  error_class: null,
+  source_lag: "00:02:00",
+  fetch_latency_ms: 125,
+  error_rate: 0,
+  duplicate_ratio: 0,
+  geographic_completeness: 1,
+  schema_failure_count: 0,
+  rate_limit_resets_at: null,
+} as const;
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
+
+describe("server-only Supabase environment", () => {
+  it("accepts HTTPS and local HTTP origins and normalizes trailing slashes", () => {
+    expect(
+      readSupabaseServerEnvironment({
+        SUPABASE_URL: "https://project.supabase.co/",
+        SUPABASE_PUBLISHABLE_KEY: TEST_ENVIRONMENT.publishableKey,
+      }),
+    ).toEqual(TEST_ENVIRONMENT);
+
+    expect(
+      readSupabaseServerEnvironment({
+        SUPABASE_URL: "http://127.0.0.1:54321/",
+        SUPABASE_PUBLISHABLE_KEY: TEST_ENVIRONMENT.publishableKey,
+      }).url,
+    ).toBe("http://127.0.0.1:54321");
+  });
+
+  it("fails closed without disclosing invalid environment values", () => {
+    const invalidKey = "sensitive-but-invalid";
+
+    expect(() =>
+      readSupabaseServerEnvironment({
+        SUPABASE_URL: "http://remote.example.com/unsafe",
+        SUPABASE_PUBLISHABLE_KEY: invalidKey,
+      }),
+    ).toThrow(SupabaseServerConfigurationError);
+
+    try {
+      readSupabaseServerEnvironment({
+        SUPABASE_URL: "http://remote.example.com/unsafe",
+        SUPABASE_PUBLISHABLE_KEY: invalidKey,
+      });
+    } catch (error) {
+      expect(String(error)).not.toContain(invalidKey);
+      expect(String(error)).not.toContain("remote.example.com");
+    }
+  });
+});
+
+describe("typed api-schema PostgREST reads", () => {
+  it("uses only the publishable apikey and validates the response with Zod", async () => {
+    const fetchMock = vi.fn(async (...arguments_: Parameters<typeof fetch>) => {
+      void arguments_;
+      return Response.json([CATALOG_ROW]);
+    });
+
+    const rows = await readPostgrestRows({
+      environment: TEST_ENVIRONMENT,
+      fetchImpl: fetchMock as typeof fetch,
+      resource: "source_catalog",
+      query: { select: "source_id,slug", limit: "1" },
+      rowSchema: sourceCatalogRowSchema,
+    });
+
+    expect(rows[0]?.updated_at).toBe("2026-07-30T00:00:00.000Z");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    const call = fetchMock.mock.calls[0];
+    expect(call).toBeDefined();
+    const [input, init] = call ?? [];
+    const url = new URL(String(input));
+    const headers = new Headers(init?.headers);
+
+    expect(url.origin).toBe(TEST_ENVIRONMENT.url);
+    expect(url.pathname).toBe("/rest/v1/source_catalog");
+    expect(url.searchParams.get("select")).toBe("source_id,slug");
+    expect(url.searchParams.get("limit")).toBe("1");
+    expect(headers.get("accept-profile")).toBe("api");
+    expect(headers.get("apikey")).toBe(TEST_ENVIRONMENT.publishableKey);
+    expect(headers.has("authorization")).toBe(false);
+    expect(init?.cache).toBe("no-store");
+  });
+
+  it("rejects malformed rows without surfacing the response body", async () => {
+    const marker = "upstream-private-detail";
+    const fetchMock = vi.fn(async () =>
+      Response.json([{ ...CATALOG_ROW, source_id: marker }]),
+    );
+
+    await expect(
+      readPostgrestRows({
+        environment: TEST_ENVIRONMENT,
+        fetchImpl: fetchMock as typeof fetch,
+        resource: "source_catalog",
+        query: { select: "*" },
+        rowSchema: sourceCatalogRowSchema,
+      }),
+    ).rejects.toMatchObject({ code: "invalid_response" });
+
+    try {
+      await readPostgrestRows({
+        environment: TEST_ENVIRONMENT,
+        fetchImpl: fetchMock as typeof fetch,
+        resource: "source_catalog",
+        query: { select: "*" },
+        rowSchema: sourceCatalogRowSchema,
+      });
+    } catch (error) {
+      expect(String(error)).not.toContain(marker);
+    }
+  });
+
+  it("aborts bounded reads and reports a safe timeout", async () => {
+    const fetchMock = vi.fn(
+      (_input: Parameters<typeof fetch>[0], init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            "abort",
+            () => reject(new DOMException("aborted", "AbortError")),
+            { once: true },
+          );
+        }),
+    );
+
+    await expect(
+      readPostgrestRows({
+        environment: TEST_ENVIRONMENT,
+        fetchImpl: fetchMock as typeof fetch,
+        timeoutMs: 5,
+        resource: "source_health",
+        query: { select: "source_id" },
+        rowSchema: z.strictObject({ source_id: z.string() }),
+      }),
+    ).rejects.toEqual(new SupabasePostgrestReadError("timeout"));
+  });
+});
+
+function configureRouteEnvironment() {
+  vi.stubEnv("SUPABASE_URL", TEST_ENVIRONMENT.url);
+  vi.stubEnv(
+    "SUPABASE_PUBLISHABLE_KEY",
+    TEST_ENVIRONMENT.publishableKey,
+  );
+}
+
+function installRouteFetch() {
+  const fetchMock = vi.fn(
+    async (input: Parameters<typeof fetch>[0]) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/source_catalog")) {
+        return Response.json([CATALOG_ROW]);
+      }
+      if (url.pathname.endsWith("/source_health")) {
+        return Response.json([HEALTH_ROW]);
+      }
+      return Response.json({ error: "unexpected test route" }, { status: 404 });
+    },
+  );
+  vi.stubGlobal("fetch", fetchMock);
+  return fetchMock;
+}
+
+describe("GET /api/v3/shadow/sources", () => {
+  it("returns deterministic global catalog and health data with CDN caching", async () => {
+    configureRouteEnvironment();
+    const fetchMock = installRouteFetch();
+
+    const response = await GET(
+      new Request("http://localhost/api/v3/shadow/sources"),
+    );
+    const payload = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toContain("s-maxage=30");
+    expect(response.headers.get("etag")).toMatch(/^"[A-Za-z0-9_-]+"$/);
+    expect(payload).toMatchObject({
+      schemaVersion: 3,
+      mode: "shadow",
+      scope: "global-targets",
+      asOf: "2026-07-30T01:00:00.000Z",
+      items: [
+        {
+          source: {
+            id: CATALOG_ROW.source_id,
+            key: CATALOG_ROW.slug,
+            provider: { key: CATALOG_ROW.provider_slug },
+          },
+          target: { id: HEALTH_ROW.collection_target_id },
+          health: {
+            sampleId: HEALTH_ROW.health_id,
+            state: "healthy",
+            latestSourceObservedAt: "2026-07-30T00:57:00.000Z",
+          },
+        },
+      ],
+      page: { nextCursor: null },
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    const etag = response.headers.get("etag");
+    expect(etag).not.toBeNull();
+    const conditional = await GET(
+      new Request("http://localhost/api/v3/shadow/sources", {
+        headers: { "If-None-Match": etag ?? "" },
+      }),
+    );
+    expect(conditional.status).toBe(304);
+    expect(await conditional.text()).toBe("");
+  });
+
+  it("fails closed and skips the network when server configuration is absent", async () => {
+    vi.stubEnv("SUPABASE_URL", "");
+    vi.stubEnv("SUPABASE_PUBLISHABLE_KEY", "");
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await GET(
+      new Request("http://localhost/api/v3/shadow/sources"),
+    );
+    const body = await response.text();
+
+    expect(response.status).toBe(503);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(body).toContain("read_model_unavailable");
+    expect(body).not.toContain("SUPABASE_URL");
+    expect(body).not.toContain("SUPABASE_PUBLISHABLE_KEY");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("returns a generic uncached error without relaying PostgREST details", async () => {
+    configureRouteEnvironment();
+    const marker = "database-private-detail";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => Response.json({ message: marker }, { status: 500 })),
+    );
+
+    const response = await GET(
+      new Request("http://localhost/api/v3/shadow/sources"),
+    );
+    const body = await response.text();
+
+    expect(response.status).toBe(503);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(body).toContain("read_model_unavailable");
+    expect(body).not.toContain(marker);
+  });
+
+  it("rejects malformed, repeated, and unknown query parameters before fetching", async () => {
+    configureRouteEnvironment();
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const paths = [
+      "/api/v3/shadow/sources?limit=101",
+      "/api/v3/shadow/sources?limit=1&limit=2",
+      "/api/v3/shadow/sources?unknown=true",
+      "/api/v3/shadow/sources?after=not-a-cursor",
+    ];
+
+    for (const path of paths) {
+      const response = await GET(new Request(`http://localhost${path}`));
+      expect(response.status).toBe(400);
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      expect(await response.text()).toContain("invalid_request");
+    }
+
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});

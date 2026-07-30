@@ -1,6 +1,6 @@
 # Production Architecture
 
-**Status:** implementation foundation
+**Status:** production foundation deployed; shadow integration in progress
 **Updated:** 30 July 2026
 
 ## Purpose
@@ -255,7 +255,9 @@ an upstream failure into an empty observation set.
 6. **Operational context:** add P1 feeds only after source-specific licensing,
    privacy, attribution, quota, and failure-mode review.
 
-No live database migration or public cutover is part of the foundation step.
+The production foundation migration was applied on 30 July 2026. It remains
+inert: no sources or collection targets are enabled, no incidents or evidence
+were seeded, and the public UI has not cut over to the database read model.
 
 ## Production gates
 

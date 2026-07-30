@@ -66,26 +66,39 @@ export function parseFireServiceBoard(html: string): FireServiceIncident {
     throw new Error("Plomari row not found");
   }
 
-  const matches = Array.from(section.matchAll(INCIDENT_CONTAINER_PATTERN)).filter(
-    (candidate) => {
-      const candidateText = normalizeSearch(candidate[0] ?? "");
-      const candidateStatus = statusFromContainerClass(candidate[1] ?? "");
-      return (
-        candidateText.includes(PLOMARI_ROW) &&
-        (candidateText.includes(PLOMARI_STARTED_ON) || candidateStatus === "ended")
-      );
-    },
+  const candidates = Array.from(section.matchAll(INCIDENT_CONTAINER_PATTERN))
+    .map((match) => ({
+      match,
+      text: normalizeSearch(match[0] ?? ""),
+      status: statusFromContainerClass(match[1] ?? ""),
+    }))
+    .filter(
+      (candidate) =>
+        candidate.status !== null && candidate.text.includes(PLOMARI_ROW),
+    );
+  const activeCandidates = candidates.filter(
+    (candidate) => candidate.status !== "ended",
   );
+  const datedCandidates = candidates.filter((candidate) =>
+    candidate.text.includes(PLOMARI_STARTED_ON),
+  );
+  const matches =
+    activeCandidates.length > 0
+      ? activeCandidates
+      : datedCandidates.length > 0
+        ? datedCandidates
+        : candidates;
   if (matches.length !== 1) {
     throw new Error("Plomari incident signature not unique");
   }
-  const match = matches[0];
+  const candidate = matches[0];
+  const match = candidate?.match;
   const container = match?.[0];
   if (container === undefined) {
     throw new Error("Plomari incident container not parsed");
   }
 
-  const containerStatus = statusFromContainerClass(match?.[1] ?? "");
+  const containerStatus = candidate?.status ?? null;
   const containerIndex = match?.index;
   if (containerIndex === undefined) {
     throw new Error("Plomari incident position not parsed");

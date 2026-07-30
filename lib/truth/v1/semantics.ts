@@ -5,8 +5,13 @@ import {
 import {
   sourceDefinitionSchema,
   type Assertion,
+  type EndpointBoundSourceItem,
+  type GlobalObservation,
+  type IncidentObservationLink,
+  type IsoDateTime,
   type Observation,
   type SourceDefinition,
+  type SourceEndpoint,
   type TemporalValue,
   type ValidationReasonCode,
   type ValidationState,
@@ -44,7 +49,7 @@ export function validateTemporalValue(
 }
 
 export function validateObservationTimes(
-  observation: Observation,
+  observation: Pick<GlobalObservation, "observedTime" | "effectiveTime">,
   now: string,
   futureToleranceSeconds = DEFAULT_FUTURE_TOLERANCE_SECONDS,
 ): SemanticValidationResult {
@@ -71,18 +76,30 @@ export function validateObservationTimes(
   return { state: "accepted", reasonCodes: [] };
 }
 
-export type ProtectiveActionProvenance = {
+export type LegacyReplayProtectiveActionProvenance = {
   readonly source: SourceDefinition;
   readonly observation: Observation;
   readonly assertion: Assertion;
 };
 
-export function validateProtectiveActionProvenance(
-  provenance: ProtectiveActionProvenance,
+export type ProtectiveActionProvenance = {
+  readonly endpoint: SourceEndpoint;
+  readonly sourceItem: EndpointBoundSourceItem;
+  readonly observation: GlobalObservation;
+  readonly incidentLink: IncidentObservationLink;
+  readonly assertion: Assertion;
+  readonly evaluatedAt: IsoDateTime;
+};
+
+function validateProtectiveActionChain(
+  source: Pick<SourceDefinition, "sourceKind" | "authorityScopes">,
+  observation: Pick<
+    GlobalObservation,
+    "validationState" | "observationType"
+  >,
+  assertion: Assertion,
 ): SemanticValidationResult {
   const reasons: ValidationReasonCode[] = [];
-  const { source, observation, assertion } = provenance;
-
   if (
     source.sourceKind === "publisher" ||
     source.sourceKind === "public_broadcaster"
@@ -112,6 +129,72 @@ export function validateProtectiveActionProvenance(
     assertion.extractionMethod !== "deterministic_parser"
   ) {
     reasons.push("untrusted_protective_instruction");
+  }
+
+  const unique = uniqueReasons(reasons);
+  return unique.length === 0
+    ? { state: "accepted", reasonCodes: [] }
+    : { state: "rejected", reasonCodes: unique };
+}
+
+/** @deprecated Replay-only check; it is not a production authorization gate. */
+export function validateLegacyReplayProtectiveActionProvenance(
+  provenance: LegacyReplayProtectiveActionProvenance,
+): SemanticValidationResult {
+  const { source, observation, assertion } = provenance;
+  return validateProtectiveActionChain(source, observation, assertion);
+}
+
+export function validateProtectiveActionProvenance(
+  provenance: ProtectiveActionProvenance,
+): SemanticValidationResult {
+  const {
+    endpoint,
+    sourceItem,
+    observation,
+    incidentLink,
+    assertion,
+    evaluatedAt,
+  } = provenance;
+  const base = validateProtectiveActionChain(
+    endpoint,
+    observation,
+    assertion,
+  );
+  const reasons: ValidationReasonCode[] = [...base.reasonCodes];
+
+  if (
+    sourceItem.sourceEndpointId !== endpoint.id ||
+    observation.sourceItemId !== sourceItem.id ||
+    incidentLink.observationId !== observation.id ||
+    assertion.observationId !== observation.id ||
+    assertion.incidentId !== incidentLink.incidentId
+  ) {
+    reasons.push("provenance_chain_mismatch");
+  }
+  if (assertion.state !== "active") {
+    reasons.push("inactive_assertion");
+  }
+  const evaluatedAtMs = Date.parse(evaluatedAt);
+  if (!Number.isFinite(evaluatedAtMs)) {
+    reasons.push("invalid_timestamp");
+  } else {
+    if (
+      assertion.expiresAt !== null &&
+      Date.parse(assertion.expiresAt) <= evaluatedAtMs
+    ) {
+      reasons.push("expired_assertion");
+    }
+    if (
+      Date.parse(sourceItem.recordedAt) > evaluatedAtMs ||
+      Date.parse(observation.recordedAt) > evaluatedAtMs ||
+      Date.parse(incidentLink.linkedAt) > evaluatedAtMs ||
+      Date.parse(assertion.recordedAt) > evaluatedAtMs ||
+      (assertion.effectiveTime.precision === "exact" &&
+        Date.parse(assertion.effectiveTime.instant) > evaluatedAtMs)
+    ) {
+      reasons.push("provenance_timing_mismatch");
+    }
   }
 
   const unique = uniqueReasons(reasons);

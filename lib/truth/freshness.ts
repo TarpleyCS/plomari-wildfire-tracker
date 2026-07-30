@@ -1,4 +1,5 @@
 import type {
+  CollectionTarget,
   IsoDateTime,
   SourceDefinition,
   SourceHealthState,
@@ -43,8 +44,8 @@ function ageSeconds(
   return Math.max(0, Math.floor((nowMs - timestampMs) / 1000));
 }
 
-export function calculateSourceFreshness(
-  source: SourceDefinition,
+function calculateFreshness(
+  staleAfterSeconds: number,
   input: FreshnessInput,
 ): FreshnessResult {
   const collectorAgeSeconds = ageSeconds(input.now, input.lastSuccessAt);
@@ -55,7 +56,7 @@ export function calculateSourceFreshness(
   const base = {
     collectorAgeSeconds,
     publicationAgeSeconds,
-    staleAfterSeconds: source.staleAfterSeconds,
+    staleAfterSeconds,
   };
 
   if (!input.enabled) {
@@ -77,11 +78,27 @@ export function calculateSourceFreshness(
   if (collectorAgeSeconds === null) {
     return { ...base, state: "unknown", reason: "never_succeeded" };
   }
-  if (collectorAgeSeconds > source.staleAfterSeconds) {
+  if (collectorAgeSeconds > staleAfterSeconds) {
     return { ...base, state: "stale", reason: "collector_stale" };
   }
   if (input.consecutiveFailures > 0) {
     return { ...base, state: "failed", reason: "collector_failed" };
   }
   return { ...base, state: "healthy", reason: "healthy" };
+}
+
+/** The canonical freshness policy is owned by a collection target. */
+export function calculateCollectionTargetFreshness(
+  target: Pick<CollectionTarget, "staleAfterSeconds">,
+  input: FreshnessInput,
+): FreshnessResult {
+  return calculateFreshness(target.staleAfterSeconds, input);
+}
+
+/** @deprecated Use calculateCollectionTargetFreshness. */
+export function calculateSourceFreshness(
+  source: SourceDefinition,
+  input: FreshnessInput,
+): FreshnessResult {
+  return calculateFreshness(source.staleAfterSeconds, input);
 }

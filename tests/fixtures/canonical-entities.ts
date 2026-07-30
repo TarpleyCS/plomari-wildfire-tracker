@@ -1,4 +1,14 @@
+import {
+  PLOMARI_COLLECTION_TARGET_REVISIONS,
+  PLOMARI_COLLECTION_TARGETS,
+  PLOMARI_INCIDENT_SOURCE_BINDINGS,
+  SOURCE_ENDPOINTS,
+  SOURCE_PROVIDERS,
+} from "../../lib/truth/collection-registry";
 import { SOURCE_REGISTRY } from "../../lib/truth/source-registry";
+
+const CONTRACT_VERSION = "1.1.0" as const;
+const IDENTITY_ALGORITHM_VERSION = "2.0.0" as const;
 
 export const IDS = {
   ingestionRun: "0198a1b2-c3d4-7e5f-8a9b-001122334401",
@@ -12,6 +22,7 @@ export const IDS = {
   snapshotAfter: "0198a1b2-c3d4-7e5f-8a9b-001122334409",
   change: "0198a1b2-c3d4-7e5f-8a9b-001122334410",
   sourceHealth: "0198a1b2-c3d4-7e5f-8a9b-001122334411",
+  observationLink: "0198a1b2-c3d4-7e5f-8a9b-001122334412",
 } as const;
 
 export const exactTime = {
@@ -28,9 +39,59 @@ export const dateOnlyTime = {
   sourceTimezone: "Europe/Athens",
 } as const;
 
+export const validIncident = {
+  contractVersion: CONTRACT_VERSION,
+  id: IDS.incident,
+  slug: "plomari-2026-07-29",
+  canonicalName: "Plomari wildfire",
+  displayNames: {
+    en: "Plomari wildfire",
+    el: "Δασική πυρκαγιά Πλωμαρίου",
+  },
+  lifecycle: "active",
+  startedAt: exactTime,
+  endedAt: null,
+  areaOfInterest: {
+    type: "Polygon",
+    coordinates: [
+      [
+        [26.2, 38.85],
+        [26.6, 38.85],
+        [26.6, 39.15],
+        [26.2, 39.15],
+        [26.2, 38.85],
+      ],
+    ],
+  },
+  areaOfInterestVersion: 1,
+  defaultTimezone: "Europe/Athens",
+  createdAt: "2026-07-29T13:59:00Z",
+  updatedAt: "2026-07-29T13:59:00Z",
+} as const;
+
+export const validSourceProvider = SOURCE_PROVIDERS.find(
+  (provider) => provider.key === "greek-civil-protection",
+)!;
+export const validSourceEndpoint = SOURCE_ENDPOINTS.find(
+  (endpoint) => endpoint.key === "112-greece-account",
+)!;
+export const validCollectionTarget = PLOMARI_COLLECTION_TARGETS.find(
+  (target) => target.key === "plomari-112-account",
+)!;
+export const validCollectionTargetRevision =
+  PLOMARI_COLLECTION_TARGET_REVISIONS.find(
+    (revision) => revision.collectionTargetId === validCollectionTarget.id,
+  )!;
+export const validIncidentSourceBinding =
+  PLOMARI_INCIDENT_SOURCE_BINDINGS.find(
+    (binding) => binding.collectionTargetId === validCollectionTarget.id,
+  )!;
+
 export const validIngestionRun = {
+  contractVersion: CONTRACT_VERSION,
   id: IDS.ingestionRun,
   sourceKey: "112-greece",
+  collectionTargetId: null,
   startedAt: "2026-07-29T13:59:00Z",
   finishedAt: "2026-07-29T13:59:01Z",
   status: "success",
@@ -44,7 +105,27 @@ export const validIngestionRun = {
   collectorVersion: "1.0.0",
 } as const;
 
+export const validTargetedIngestionRun = {
+  contractVersion: CONTRACT_VERSION,
+  id: IDS.ingestionRun,
+  collectionTargetId: validCollectionTarget.id,
+  collectionTargetRevisionId: validCollectionTargetRevision.id,
+  startedAt: validIngestionRun.startedAt,
+  finishedAt: validIngestionRun.finishedAt,
+  status: validIngestionRun.status,
+  httpStatus: validIngestionRun.httpStatus,
+  latencyMs: validIngestionRun.latencyMs,
+  payloadHash: validIngestionRun.payloadHash,
+  rawObjectKey: validIngestionRun.rawObjectKey,
+  itemCount: validIngestionRun.itemCount,
+  errorClass: validIngestionRun.errorClass,
+  errorDetailSafe: validIngestionRun.errorDetailSafe,
+  collectorVersion: validIngestionRun.collectorVersion,
+} as const;
+
 export const validSourceItem = {
+  contractVersion: CONTRACT_VERSION,
+  identityAlgorithmVersion: IDENTITY_ALGORITHM_VERSION,
   id: IDS.sourceItem,
   sourceKey: "112-greece",
   externalId: "2082468150189167080",
@@ -69,7 +150,29 @@ export const validSourceItem = {
   },
 } as const;
 
+export const validEndpointBoundSourceItem = {
+  contractVersion: CONTRACT_VERSION,
+  identityAlgorithmVersion: IDENTITY_ALGORITHM_VERSION,
+  id: IDS.sourceItem,
+  sourceEndpointId: validSourceEndpoint.id,
+  ingestionRunId: IDS.ingestionRun,
+  externalId: validSourceItem.externalId,
+  canonicalUrl: validSourceItem.canonicalUrl,
+  versionNumber: validSourceItem.versionNumber,
+  supersedesId: validSourceItem.supersedesId,
+  contentHash: validSourceItem.contentHash,
+  title: validSourceItem.title,
+  language: validSourceItem.language,
+  publishedTime: validSourceItem.publishedTime,
+  modifiedTime: validSourceItem.modifiedTime,
+  retrievedAt: validSourceItem.retrievedAt,
+  recordedAt: validSourceItem.recordedAt,
+  rawExcerpt: validSourceItem.rawExcerpt,
+  rawPayload: validSourceItem.rawPayload,
+} as const;
+
 export const validObservation = {
+  contractVersion: CONTRACT_VERSION,
   id: IDS.observation,
   incidentId: IDS.incident,
   sourceItemId: IDS.sourceItem,
@@ -92,7 +195,44 @@ export const validObservation = {
   validationReasons: [],
 } as const;
 
+export const validGlobalObservation = {
+  contractVersion: CONTRACT_VERSION,
+  id: IDS.observation,
+  sourceItemId: IDS.sourceItem,
+  observationType: "protective_instruction",
+  observedTime: exactTime,
+  effectiveTime: exactTime,
+  geometry: {
+    type: "Point",
+    coordinates: [26.368, 38.976],
+  },
+  geometryPrecisionM: 1_000,
+  measurements: {},
+  quality: {
+    accountVerified: true,
+  },
+  parserVersion: "1.0.0",
+  recordedAt: "2026-07-29T13:59:01Z",
+  validationState: "accepted",
+  validationReasons: [],
+} as const;
+
+export const validIncidentObservationLink = {
+  contractVersion: CONTRACT_VERSION,
+  id: IDS.observationLink,
+  incidentId: IDS.incident,
+  observationId: IDS.observation,
+  relevanceMethod: "geometry",
+  rationaleCode: "inside-incident-area",
+  incidentAreaVersion: validIncident.areaOfInterestVersion,
+  incidentAreaOfInterest: validIncident.areaOfInterest,
+  distanceToAreaKm: 0,
+  linkedAt: "2026-07-29T13:59:02Z",
+  linkedBy: "incident-relevance-1.0.0",
+} as const;
+
 export const validAssertion = {
+  contractVersion: CONTRACT_VERSION,
   id: IDS.assertion,
   incidentId: IDS.incident,
   observationId: IDS.observation,
@@ -110,9 +250,11 @@ export const validAssertion = {
   extractionMethod: "deterministic_parser",
   extractionVersion: "1.0.0",
   state: "active",
+  recordedAt: "2026-07-29T13:59:03Z",
 } as const;
 
 export const validCanonicalEvent = {
+  contractVersion: CONTRACT_VERSION,
   id: IDS.event,
   incidentId: IDS.incident,
   eventType: "protective_instruction",
@@ -141,6 +283,7 @@ export const validCanonicalEvent = {
 } as const;
 
 export const validEventEvidence = {
+  contractVersion: CONTRACT_VERSION,
   eventId: IDS.event,
   assertionId: IDS.assertion,
   relationship: "supports",
@@ -149,6 +292,7 @@ export const validEventEvidence = {
 } as const;
 
 export const validProtectiveAction = {
+  contractVersion: CONTRACT_VERSION,
   sourceEventId: IDS.event,
   instructionEn: "Move toward Agios Isidoros.",
   instructionEl: "Απομακρυνθείτε προς τον Άγιο Ισίδωρο.",
@@ -168,6 +312,8 @@ export const validProtectiveAction = {
 } as const;
 
 export const validIncidentStateSnapshot = {
+  contractVersion: CONTRACT_VERSION,
+  identityAlgorithmVersion: IDENTITY_ALGORITHM_VERSION,
   id: IDS.snapshotAfter,
   incidentId: IDS.incident,
   sequence: 2,
@@ -181,6 +327,7 @@ export const validIncidentStateSnapshot = {
 } as const;
 
 export const validMaterialChange = {
+  contractVersion: CONTRACT_VERSION,
   id: IDS.change,
   incidentId: IDS.incident,
   sequence: 2,
@@ -199,8 +346,10 @@ export const validMaterialChange = {
 } as const;
 
 export const validSourceHealthSample = {
+  contractVersion: CONTRACT_VERSION,
   id: IDS.sourceHealth,
   sourceKey: "112-greece",
+  collectionTargetId: null,
   sampledAt: "2026-07-29T13:59:05Z",
   state: "healthy",
   lastAttemptAt: "2026-07-29T13:59:00Z",
@@ -212,10 +361,37 @@ export const validSourceHealthSample = {
   errorClass: null,
 } as const;
 
+export const validTargetedSourceHealthSample = {
+  contractVersion: CONTRACT_VERSION,
+  id: IDS.sourceHealth,
+  collectionTargetId: validCollectionTarget.id,
+  collectionTargetRevisionId: validCollectionTargetRevision.id,
+  sampledAt: validSourceHealthSample.sampledAt,
+  state: validSourceHealthSample.state,
+  lastAttemptAt: validSourceHealthSample.lastAttemptAt,
+  lastSuccessAt: validSourceHealthSample.lastSuccessAt,
+  lastChangedPayloadAt: validSourceHealthSample.lastChangedPayloadAt,
+  latestSourcePublicationAt:
+    validSourceHealthSample.latestSourcePublicationAt,
+  consecutiveFailures: validSourceHealthSample.consecutiveFailures,
+  latencyMs: validSourceHealthSample.latencyMs,
+  errorClass: validSourceHealthSample.errorClass,
+} as const;
+
 export const VALID_SCHEMA_EXAMPLES = {
-  sourceDefinition: SOURCE_REGISTRY[0],
+  incident: validIncident,
+  sourceProvider: validSourceProvider,
+  sourceEndpoint: validSourceEndpoint,
+  collectionTarget: validCollectionTarget,
+  collectionTargetRevision: validCollectionTargetRevision,
+  incidentSourceBinding: validIncidentSourceBinding,
+  sourceDefinition: SOURCE_REGISTRY[0]!,
   ingestionRun: validIngestionRun,
+  targetedIngestionRun: validTargetedIngestionRun,
   sourceItem: validSourceItem,
+  endpointBoundSourceItem: validEndpointBoundSourceItem,
+  globalObservation: validGlobalObservation,
+  incidentObservationLink: validIncidentObservationLink,
   observation: validObservation,
   assertion: validAssertion,
   canonicalEvent: validCanonicalEvent,
@@ -224,4 +400,5 @@ export const VALID_SCHEMA_EXAMPLES = {
   incidentStateSnapshot: validIncidentStateSnapshot,
   materialChange: validMaterialChange,
   sourceHealthSample: validSourceHealthSample,
+  targetedSourceHealthSample: validTargetedSourceHealthSample,
 } as const;

@@ -1,7 +1,12 @@
 import type { SourceDefinition } from "./domain";
+import { deepFreeze } from "./immutability";
 import { validateSourceRegistryDefinitions } from "./v1/semantics";
 
-export const SOURCE_REGISTRY = [
+/**
+ * @deprecated v1.0 compatibility registry. New collection code must use the
+ * provider, endpoint and target registries exported from collection-registry.
+ */
+const SOURCE_REGISTRY_INPUT = [
   {
     key: "fire-service-board",
     name: "Hellenic Fire Service incident board",
@@ -278,6 +283,8 @@ export const SOURCE_REGISTRY = [
       "Measured airport conditions. Terrain at the fireground can differ materially.",
   },
 ] as const satisfies readonly SourceDefinition[];
+
+export const SOURCE_REGISTRY = deepFreeze(SOURCE_REGISTRY_INPUT);
 
 export type SourceKey = (typeof SOURCE_REGISTRY)[number]["key"];
 

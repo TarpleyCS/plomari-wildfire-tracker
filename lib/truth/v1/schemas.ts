@@ -1,17 +1,24 @@
 import { z } from "zod";
 
+import type { DeepReadonly } from "../immutability";
 import {
+  CONTRACT_VERSION,
+  IDENTITY_ALGORITHM_VERSION,
   adapterFixtureScenarios,
   adapterNames,
   assertionStates,
   assertionTypes,
   authorityScopes,
+  collectionTargetKinds,
   contentPolicies,
   errorClasses,
   eventLifecycles,
   evidenceRelationships,
   extractionMethods,
+  incidentLifecycles,
+  incidentSourceBindingPurposes,
   ingestionStatuses,
+  identityAlgorithmVersions,
   materialChangeTypes,
   materialityLevels,
   normalizedOfficialStatuses,
@@ -20,6 +27,7 @@ import {
   relevanceMethods,
   roadConditionStates,
   sourceHealthStates,
+  sourceEndpointKinds,
   sourceKinds,
   timePrecisions,
   validationReasonCodes,
@@ -77,6 +85,13 @@ export const httpsUrlSchema = z
 export const languageTagSchema = z
   .string()
   .regex(LANGUAGE_TAG_PATTERN, "Expected a BCP-47-style language tag");
+export const contractVersionSchema = z.literal(CONTRACT_VERSION);
+export const identityAlgorithmVersionSchema = z.literal(
+  IDENTITY_ALGORITHM_VERSION,
+);
+export const knownIdentityAlgorithmVersionSchema = z.enum(
+  identityAlgorithmVersions,
+);
 
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue =
@@ -96,6 +111,12 @@ export const jsonValueSchema: z.ZodType<JsonValue> = z.lazy(() =>
 );
 
 export const sourceKindSchema = z.enum(sourceKinds);
+export const incidentLifecycleSchema = z.enum(incidentLifecycles);
+export const sourceEndpointKindSchema = z.enum(sourceEndpointKinds);
+export const collectionTargetKindSchema = z.enum(collectionTargetKinds);
+export const incidentSourceBindingPurposeSchema = z.enum(
+  incidentSourceBindingPurposes,
+);
 export const authorityScopeSchema = z.enum(authorityScopes);
 export const timePrecisionSchema = z.enum(timePrecisions);
 export const ingestionStatusSchema = z.enum(ingestionStatuses);
@@ -162,6 +183,11 @@ export const geoJsonGeometrySchema = z.discriminatedUnion("type", [
   multiPolygonGeometrySchema,
 ]);
 
+export const areaGeometrySchema = z.discriminatedUnion("type", [
+  polygonGeometrySchema,
+  multiPolygonGeometrySchema,
+]);
+
 export const temporalValueSchema = z.discriminatedUnion("precision", [
   z.strictObject({
     precision: z.literal("exact"),
@@ -182,6 +208,193 @@ export const temporalValueSchema = z.discriminatedUnion("precision", [
   }),
 ]);
 
+export const incidentSchema = z
+  .strictObject({
+    contractVersion: contractVersionSchema,
+    id: uuidV7Schema,
+    slug: sourceKeySchema,
+    canonicalName: z.string().min(1).max(256),
+    displayNames: z
+      .record(languageTagSchema, z.string().min(1).max(256))
+      .refine((names) => Object.keys(names).length > 0, {
+        message: "At least one localized display name is required",
+      }),
+    lifecycle: incidentLifecycleSchema,
+    startedAt: temporalValueSchema,
+    endedAt: utcInstantSchema.nullable(),
+    areaOfInterest: areaGeometrySchema,
+    areaOfInterestVersion: z.number().int().positive(),
+    defaultTimezone: z.string().min(1).max(128),
+    createdAt: utcInstantSchema,
+    updatedAt: utcInstantSchema,
+  })
+  .superRefine((incident, context) => {
+    if (Date.parse(incident.updatedAt) < Date.parse(incident.createdAt)) {
+      context.addIssue({
+        code: "custom",
+        message: "updatedAt must not precede createdAt",
+        path: ["updatedAt"],
+      });
+    }
+    if (
+      incident.startedAt.precision === "exact" &&
+      incident.endedAt !== null &&
+      Date.parse(incident.endedAt) < Date.parse(incident.startedAt.instant)
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "endedAt must not precede startedAt",
+        path: ["endedAt"],
+      });
+    }
+  });
+
+export const sourceProviderSchema = z.strictObject({
+  contractVersion: contractVersionSchema,
+  key: sourceKeySchema,
+  name: z.string().min(1).max(256),
+  homepageUrl: httpsUrlSchema,
+  defaultLicensePolicy: z.string().min(1).max(256),
+  notes: z.string().min(1).max(2_000),
+});
+
+export const sourceEndpointSchema = z.strictObject({
+  contractVersion: contractVersionSchema,
+  id: uuidV7Schema,
+  key: sourceKeySchema,
+  providerKey: sourceKeySchema,
+  endpointKind: sourceEndpointKindSchema,
+  name: z.string().min(1).max(256),
+  sourceKind: sourceKindSchema,
+  authorityScopes: z.array(authorityScopeSchema).min(1),
+  contentPolicy: z.enum(contentPolicies),
+  licensePolicy: z.string().min(1).max(256),
+  dataUrl: httpsUrlSchema,
+  adapterName: adapterNameSchema,
+  adapterVersion: versionSchema,
+  credentialRef: z.string().min(1).max(256).nullable(),
+});
+
+export const collectionTargetSchema = z
+  .strictObject({
+    contractVersion: contractVersionSchema,
+    id: uuidV7Schema,
+    key: sourceKeySchema,
+    endpointId: uuidV7Schema,
+    targetKind: collectionTargetKindSchema,
+    name: z.string().min(1).max(256),
+    requestConfig: z.record(z.string(), jsonValueSchema),
+    geometry: geoJsonGeometrySchema.nullable(),
+    geometryPrecisionM: z.number().finite().nonnegative().nullable(),
+    expectedCadenceSeconds: z.number().int().positive(),
+    staleAfterSeconds: z.number().int().positive(),
+    enabledByDefault: z.boolean(),
+    createdAt: utcInstantSchema,
+    updatedAt: utcInstantSchema,
+  })
+  .superRefine((target, context) => {
+    if ((target.geometry === null) !== (target.geometryPrecisionM === null)) {
+      context.addIssue({
+        code: "custom",
+        message:
+          "Geometry and geometry precision must either both be present or both be null",
+        path: ["geometryPrecisionM"],
+      });
+    }
+    if (target.staleAfterSeconds < target.expectedCadenceSeconds) {
+      context.addIssue({
+        code: "custom",
+        message: "Stale threshold must not precede collection cadence",
+        path: ["staleAfterSeconds"],
+      });
+    }
+    if (Date.parse(target.updatedAt) < Date.parse(target.createdAt)) {
+      context.addIssue({
+        code: "custom",
+        message: "updatedAt must not precede createdAt",
+        path: ["updatedAt"],
+      });
+    }
+  });
+
+/** Immutable configuration used by a specific collection attempt. */
+export const collectionTargetRevisionSchema = z
+  .strictObject({
+    contractVersion: contractVersionSchema,
+    identityAlgorithmVersion: identityAlgorithmVersionSchema,
+    id: uuidV7Schema,
+    collectionTargetId: uuidV7Schema,
+    endpointId: uuidV7Schema,
+    versionNumber: z.number().int().positive(),
+    supersedesId: uuidV7Schema.nullable(),
+    targetKind: collectionTargetKindSchema,
+    requestConfig: z.record(z.string(), jsonValueSchema),
+    geometry: geoJsonGeometrySchema.nullable(),
+    geometryPrecisionM: z.number().finite().nonnegative().nullable(),
+    expectedCadenceSeconds: z.number().int().positive(),
+    staleAfterSeconds: z.number().int().positive(),
+    enabled: z.boolean(),
+    configurationHash: sha256Schema,
+    createdAt: utcInstantSchema,
+  })
+  .superRefine((revision, context) => {
+    if (
+      (revision.geometry === null) !==
+      (revision.geometryPrecisionM === null)
+    ) {
+      context.addIssue({
+        code: "custom",
+        message:
+          "Geometry and geometry precision must either both be present or both be null",
+        path: ["geometryPrecisionM"],
+      });
+    }
+    if (revision.staleAfterSeconds < revision.expectedCadenceSeconds) {
+      context.addIssue({
+        code: "custom",
+        message: "Stale threshold must not precede collection cadence",
+        path: ["staleAfterSeconds"],
+      });
+    }
+    if (revision.versionNumber === 1 && revision.supersedesId !== null) {
+      context.addIssue({
+        code: "custom",
+        message: "Revision 1 cannot supersede another target revision",
+        path: ["supersedesId"],
+      });
+    }
+    if (revision.versionNumber > 1 && revision.supersedesId === null) {
+      context.addIssue({
+        code: "custom",
+        message: "A later target revision must identify its predecessor",
+        path: ["supersedesId"],
+      });
+    }
+  });
+
+export const incidentSourceBindingSchema = z
+  .strictObject({
+    contractVersion: contractVersionSchema,
+    id: uuidV7Schema,
+    incidentId: uuidV7Schema,
+    collectionTargetId: uuidV7Schema,
+    purpose: incidentSourceBindingPurposeSchema,
+    priority: z.number().int().min(0).max(100),
+    relevanceMethod: relevanceMethodSchema,
+    relevanceConfig: z.record(z.string(), jsonValueSchema),
+    enabled: z.boolean(),
+    createdAt: utcInstantSchema,
+    updatedAt: utcInstantSchema,
+  })
+  .refine(
+    (binding) => Date.parse(binding.updatedAt) >= Date.parse(binding.createdAt),
+    {
+      message: "updatedAt must not precede createdAt",
+      path: ["updatedAt"],
+    },
+  );
+
+/** @deprecated Use sourceProviderSchema, sourceEndpointSchema and collectionTargetSchema. */
 export const sourceDefinitionSchema = z
   .strictObject({
     key: sourceKeySchema,
@@ -211,23 +424,34 @@ export const sourceDefinitionSchema = z
     },
   );
 
-export const ingestionRunSchema = z
-  .strictObject({
-    id: uuidV7Schema,
-    sourceKey: sourceKeySchema,
-    startedAt: utcInstantSchema,
-    finishedAt: utcInstantSchema.nullable(),
-    status: ingestionStatusSchema,
-    httpStatus: z.number().int().min(100).max(599).nullable(),
-    latencyMs: z.number().int().nonnegative().nullable(),
-    payloadHash: sha256Schema.nullable(),
-    rawObjectKey: z.string().min(1).max(1_024).nullable(),
-    itemCount: z.number().int().nonnegative(),
-    errorClass: errorClassSchema.nullable(),
-    errorDetailSafe: z.string().min(1).max(1_000).nullable(),
-    collectorVersion: versionSchema,
-  })
-  .superRefine((run, context) => {
+const ingestionRunOperationalShape = {
+  startedAt: utcInstantSchema,
+  finishedAt: utcInstantSchema.nullable(),
+  status: ingestionStatusSchema,
+  httpStatus: z.number().int().min(100).max(599).nullable(),
+  latencyMs: z.number().int().nonnegative().nullable(),
+  payloadHash: sha256Schema.nullable(),
+  rawObjectKey: z.string().min(1).max(1_024).nullable(),
+  itemCount: z.number().int().nonnegative(),
+  errorClass: errorClassSchema.nullable(),
+  errorDetailSafe: z.string().min(1).max(1_000).nullable(),
+  collectorVersion: versionSchema,
+} as const;
+
+function addIngestionLifecycleIssues(
+  run: {
+    readonly status: z.infer<typeof ingestionStatusSchema>;
+    readonly startedAt: string;
+    readonly finishedAt: string | null;
+  },
+  context: {
+    addIssue(issue: {
+      code: "custom";
+      message: string;
+      path: PropertyKey[];
+    }): void;
+  },
+) {
     if (run.status === "running" && run.finishedAt !== null) {
       context.addIssue({
         code: "custom",
@@ -252,27 +476,63 @@ export const ingestionRunSchema = z
         path: ["finishedAt"],
       });
     }
-  });
+}
 
-export const sourceItemSchema = z
+/**
+ * @deprecated Legacy source-keyed envelope. New collectors use
+ * targetedIngestionRunSchema.
+ */
+export const ingestionRunSchema = z
   .strictObject({
+    contractVersion: contractVersionSchema,
     id: uuidV7Schema,
     sourceKey: sourceKeySchema,
-    externalId: z.string().min(1).max(1_024).nullable(),
-    canonicalUrl: httpsUrlSchema.nullable(),
-    versionNumber: z.number().int().positive(),
-    supersedesId: uuidV7Schema.nullable(),
-    contentHash: sha256Schema,
-    title: z.string().min(1).max(1_000).nullable(),
-    language: languageTagSchema.nullable(),
-    publishedTime: temporalValueSchema,
-    modifiedTime: temporalValueSchema,
-    retrievedAt: utcInstantSchema,
-    recordedAt: utcInstantSchema,
-    rawExcerpt: z.string().max(2_000).nullable(),
-    rawPayload: z.record(z.string(), jsonValueSchema),
+    collectionTargetId: uuidV7Schema.nullable(),
+    ...ingestionRunOperationalShape,
   })
-  .superRefine((item, context) => {
+  .superRefine(addIngestionLifecycleIssues);
+
+export const targetedIngestionRunSchema = z
+  .strictObject({
+    contractVersion: contractVersionSchema,
+    id: uuidV7Schema,
+    collectionTargetId: uuidV7Schema,
+    collectionTargetRevisionId: uuidV7Schema,
+    ...ingestionRunOperationalShape,
+  })
+  .superRefine(addIngestionLifecycleIssues);
+
+const sourceItemEvidenceShape = {
+  externalId: z.string().min(1).max(1_024).nullable(),
+  canonicalUrl: httpsUrlSchema.nullable(),
+  versionNumber: z.number().int().positive(),
+  supersedesId: uuidV7Schema.nullable(),
+  contentHash: sha256Schema,
+  title: z.string().min(1).max(1_000).nullable(),
+  language: languageTagSchema.nullable(),
+  publishedTime: temporalValueSchema,
+  modifiedTime: temporalValueSchema,
+  retrievedAt: utcInstantSchema,
+  recordedAt: utcInstantSchema,
+  rawExcerpt: z.string().max(2_000).nullable(),
+  rawPayload: z.record(z.string(), jsonValueSchema),
+} as const;
+
+function addSourceItemValidationIssues(
+  item: {
+    readonly versionNumber: number;
+    readonly supersedesId: string | null;
+    readonly retrievedAt: string;
+    readonly recordedAt: string;
+  },
+  context: {
+    addIssue(issue: {
+      code: "custom";
+      message: string;
+      path: PropertyKey[];
+    }): void;
+  },
+) {
     if (item.versionNumber === 1 && item.supersedesId !== null) {
       context.addIssue({
         code: "custom",
@@ -294,27 +554,65 @@ export const sourceItemSchema = z
         path: ["recordedAt"],
       });
     }
-  });
+}
 
-const observationBaseSchema = z
+/** @deprecated Legacy free-form source-key identity. */
+export const sourceItemSchema = z
   .strictObject({
+    contractVersion: contractVersionSchema,
+    identityAlgorithmVersion: knownIdentityAlgorithmVersionSchema,
     id: uuidV7Schema,
-    incidentId: uuidV7Schema,
-    sourceItemId: uuidV7Schema,
-    observationType: z.enum(observationTypes),
-    observedTime: temporalValueSchema,
-    effectiveTime: temporalValueSchema,
-    geometry: geoJsonGeometrySchema.nullable(),
-    geometryPrecisionM: z.number().finite().nonnegative().nullable(),
-    measurements: z.record(z.string(), jsonValueSchema),
-    quality: z.record(z.string(), jsonValueSchema),
-    relevanceMethod: relevanceMethodSchema,
-    parserVersion: versionSchema,
-    recordedAt: utcInstantSchema,
-    validationState: validationStateSchema,
-    validationReasons: z.array(validationReasonCodeSchema),
+    sourceKey: sourceKeySchema,
+    ...sourceItemEvidenceShape,
   })
-  .superRefine((observation, context) => {
+  .superRefine(addSourceItemValidationIssues);
+
+/** Canonical source evidence bound to a registered endpoint and target run. */
+export const endpointBoundSourceItemSchema = z
+  .strictObject({
+    contractVersion: contractVersionSchema,
+    identityAlgorithmVersion: identityAlgorithmVersionSchema,
+    id: uuidV7Schema,
+    sourceEndpointId: uuidV7Schema,
+    ingestionRunId: uuidV7Schema,
+    ...sourceItemEvidenceShape,
+  })
+  .superRefine(addSourceItemValidationIssues);
+
+const observationShape = {
+  contractVersion: contractVersionSchema,
+  id: uuidV7Schema,
+  sourceItemId: uuidV7Schema,
+  observationType: z.enum(observationTypes),
+  observedTime: temporalValueSchema,
+  effectiveTime: temporalValueSchema,
+  geometry: geoJsonGeometrySchema.nullable(),
+  geometryPrecisionM: z.number().finite().nonnegative().nullable(),
+  measurements: z.record(z.string(), jsonValueSchema),
+  quality: z.record(z.string(), jsonValueSchema),
+  parserVersion: versionSchema,
+  recordedAt: utcInstantSchema,
+  validationState: validationStateSchema,
+  validationReasons: z.array(validationReasonCodeSchema),
+} as const;
+
+function addObservationValidationIssues(
+  observation: {
+    readonly geometry: unknown | null;
+    readonly geometryPrecisionM: number | null;
+    readonly validationState: z.infer<typeof validationStateSchema>;
+    readonly validationReasons: readonly z.infer<
+      typeof validationReasonCodeSchema
+    >[];
+  },
+  context: {
+    addIssue(issue: {
+      code: "custom";
+      message: string;
+      path: PropertyKey[];
+    }): void;
+  },
+) {
     if (
       (observation.geometry === null) !==
       (observation.geometryPrecisionM === null)
@@ -346,12 +644,42 @@ const observationBaseSchema = z
         path: ["validationReasons"],
       });
     }
-  });
+}
 
-export const observationSchema = observationBaseSchema;
+/** A source observation before it is linked to any incident. */
+export const globalObservationSchema = z
+  .strictObject(observationShape)
+  .superRefine(addObservationValidationIssues);
+
+/**
+ * @deprecated Incident relevance now belongs in incidentObservationLinkSchema.
+ * Retained to replay v1.0 evidence without rewriting it in place.
+ */
+export const observationSchema = z
+  .strictObject({
+    ...observationShape,
+    incidentId: uuidV7Schema,
+    relevanceMethod: relevanceMethodSchema,
+  })
+  .superRefine(addObservationValidationIssues);
+
+export const incidentObservationLinkSchema = z.strictObject({
+  contractVersion: contractVersionSchema,
+  id: uuidV7Schema,
+  incidentId: uuidV7Schema,
+  observationId: uuidV7Schema,
+  relevanceMethod: relevanceMethodSchema,
+  rationaleCode: z.string().min(1).max(128),
+  incidentAreaVersion: z.number().int().positive(),
+  incidentAreaOfInterest: areaGeometrySchema,
+  distanceToAreaKm: z.number().finite().nonnegative().nullable(),
+  linkedAt: utcInstantSchema,
+  linkedBy: versionSchema,
+});
 
 export const assertionSchema = z
   .strictObject({
+    contractVersion: contractVersionSchema,
     id: uuidV7Schema,
     incidentId: uuidV7Schema,
     observationId: uuidV7Schema,
@@ -366,6 +694,7 @@ export const assertionSchema = z
     extractionMethod: extractionMethodSchema,
     extractionVersion: versionSchema,
     state: assertionStateSchema,
+    recordedAt: utcInstantSchema,
   })
   .superRefine((assertion, context) => {
     if (
@@ -383,6 +712,7 @@ export const assertionSchema = z
   });
 
 const eventBaseShape = {
+  contractVersion: contractVersionSchema,
   id: uuidV7Schema,
   incidentId: uuidV7Schema,
   firstEffectiveTime: temporalValueSchema,
@@ -427,8 +757,8 @@ const thermalDetectionEventSchema = eventBaseSchema.extend({
     satellite: z.string().min(1).max(128),
     frpMw: z.number().finite().nonnegative().nullable(),
     confidence: z.union([z.string().min(1).max(32), z.number().finite()]),
-    scanKm: z.number().finite().positive(),
-    trackKm: z.number().finite().positive(),
+    scanKm: z.number().finite().positive().nullable(),
+    trackKm: z.number().finite().positive().nullable(),
   }),
 });
 
@@ -536,6 +866,7 @@ export const canonicalEventSchema = z
   });
 
 export const eventEvidenceSchema = z.strictObject({
+  contractVersion: contractVersionSchema,
   eventId: uuidV7Schema,
   assertionId: uuidV7Schema,
   relationship: evidenceRelationshipSchema,
@@ -544,6 +875,7 @@ export const eventEvidenceSchema = z.strictObject({
 });
 
 export const protectiveActionSchema = z.strictObject({
+  contractVersion: contractVersionSchema,
   sourceEventId: uuidV7Schema,
   instructionEn: z.string().min(1).max(4_000).nullable(),
   instructionEl: z.string().min(1).max(4_000).nullable(),
@@ -557,6 +889,8 @@ export const protectiveActionSchema = z.strictObject({
 });
 
 export const incidentStateSnapshotSchema = z.strictObject({
+  contractVersion: contractVersionSchema,
+  identityAlgorithmVersion: identityAlgorithmVersionSchema,
   id: uuidV7Schema,
   incidentId: uuidV7Schema,
   sequence: z.number().int().positive(),
@@ -568,6 +902,7 @@ export const incidentStateSnapshotSchema = z.strictObject({
 
 export const materialChangeSchema = z
   .strictObject({
+    contractVersion: contractVersionSchema,
     id: uuidV7Schema,
     incidentId: uuidV7Schema,
     sequence: z.number().int().positive(),
@@ -609,9 +944,7 @@ export const materialChangeSchema = z
     }
   });
 
-export const sourceHealthSampleSchema = z.strictObject({
-  id: uuidV7Schema,
-  sourceKey: sourceKeySchema,
+const sourceHealthOperationalShape = {
   sampledAt: utcInstantSchema,
   state: sourceHealthStateSchema,
   lastAttemptAt: utcInstantSchema.nullable(),
@@ -621,6 +954,23 @@ export const sourceHealthSampleSchema = z.strictObject({
   consecutiveFailures: z.number().int().nonnegative(),
   latencyMs: z.number().int().nonnegative().nullable(),
   errorClass: errorClassSchema.nullable(),
+} as const;
+
+/** @deprecated New health records must use targetedSourceHealthSampleSchema. */
+export const sourceHealthSampleSchema = z.strictObject({
+  contractVersion: contractVersionSchema,
+  id: uuidV7Schema,
+  sourceKey: sourceKeySchema,
+  collectionTargetId: uuidV7Schema.nullable(),
+  ...sourceHealthOperationalShape,
+});
+
+export const targetedSourceHealthSampleSchema = z.strictObject({
+  contractVersion: contractVersionSchema,
+  id: uuidV7Schema,
+  collectionTargetId: uuidV7Schema,
+  collectionTargetRevisionId: uuidV7Schema,
+  ...sourceHealthOperationalShape,
 });
 
 const fixtureRequestSchema = z.strictObject({
@@ -680,7 +1030,17 @@ export const adapterFixtureSchema = z.strictObject({
 export type Uuid = z.infer<typeof uuidV7Schema>;
 export type IsoDateTime = z.infer<typeof utcInstantSchema>;
 export type LocalDate = z.infer<typeof localDateSchema>;
+export type ContractVersion = z.infer<typeof contractVersionSchema>;
+export type IdentityAlgorithmVersion = z.infer<
+  typeof knownIdentityAlgorithmVersionSchema
+>;
 export type SourceKind = z.infer<typeof sourceKindSchema>;
+export type IncidentLifecycle = z.infer<typeof incidentLifecycleSchema>;
+export type SourceEndpointKind = z.infer<typeof sourceEndpointKindSchema>;
+export type CollectionTargetKind = z.infer<typeof collectionTargetKindSchema>;
+export type IncidentSourceBindingPurpose = z.infer<
+  typeof incidentSourceBindingPurposeSchema
+>;
 export type AuthorityScope = z.infer<typeof authorityScopeSchema>;
 export type TimePrecision = z.infer<typeof timePrecisionSchema>;
 export type IngestionStatus = z.infer<typeof ingestionStatusSchema>;
@@ -695,24 +1055,61 @@ export type VerificationState = z.infer<typeof verificationStateSchema>;
 export type EvidenceRelationship = z.infer<typeof evidenceRelationshipSchema>;
 export type Materiality = z.infer<typeof materialitySchema>;
 export type SourceHealthState = z.infer<typeof sourceHealthStateSchema>;
-export type GeoJsonGeometry = z.infer<typeof geoJsonGeometrySchema>;
-export type TemporalValue = z.infer<typeof temporalValueSchema>;
-type ParsedSourceDefinition = z.infer<typeof sourceDefinitionSchema>;
-export type SourceDefinition = Readonly<
-  Omit<ParsedSourceDefinition, "authorityScopes"> & {
-    readonly authorityScopes: readonly AuthorityScope[];
-  }
+export type GeoJsonGeometry = DeepReadonly<
+  z.infer<typeof geoJsonGeometrySchema>
 >;
-export type IngestionRun = z.infer<typeof ingestionRunSchema>;
-export type SourceItem = z.infer<typeof sourceItemSchema>;
-export type Observation = z.infer<typeof observationSchema>;
-export type Assertion = z.infer<typeof assertionSchema>;
-export type CanonicalEvent = z.infer<typeof canonicalEventSchema>;
-export type EventEvidence = z.infer<typeof eventEvidenceSchema>;
-export type ProtectiveAction = z.infer<typeof protectiveActionSchema>;
-export type IncidentStateSnapshot = z.infer<
-  typeof incidentStateSnapshotSchema
+export type TemporalValue = DeepReadonly<z.infer<typeof temporalValueSchema>>;
+export type Incident = DeepReadonly<z.infer<typeof incidentSchema>>;
+export type SourceProvider = DeepReadonly<
+  z.infer<typeof sourceProviderSchema>
 >;
-export type MaterialChange = z.infer<typeof materialChangeSchema>;
-export type SourceHealthSample = z.infer<typeof sourceHealthSampleSchema>;
-export type AdapterFixture = z.infer<typeof adapterFixtureSchema>;
+export type SourceEndpoint = DeepReadonly<
+  z.infer<typeof sourceEndpointSchema>
+>;
+export type CollectionTarget = DeepReadonly<
+  z.infer<typeof collectionTargetSchema>
+>;
+export type CollectionTargetRevision = DeepReadonly<
+  z.infer<typeof collectionTargetRevisionSchema>
+>;
+export type IncidentSourceBinding = DeepReadonly<
+  z.infer<typeof incidentSourceBindingSchema>
+>;
+export type SourceDefinition = DeepReadonly<
+  z.infer<typeof sourceDefinitionSchema>
+>;
+export type IngestionRun = DeepReadonly<z.infer<typeof ingestionRunSchema>>;
+export type TargetedIngestionRun = DeepReadonly<
+  z.infer<typeof targetedIngestionRunSchema>
+>;
+export type SourceItem = DeepReadonly<z.infer<typeof sourceItemSchema>>;
+export type EndpointBoundSourceItem = DeepReadonly<
+  z.infer<typeof endpointBoundSourceItemSchema>
+>;
+export type GlobalObservation = DeepReadonly<
+  z.infer<typeof globalObservationSchema>
+>;
+/** @deprecated Use GlobalObservation plus IncidentObservationLink. */
+export type Observation = DeepReadonly<z.infer<typeof observationSchema>>;
+export type IncidentObservationLink = DeepReadonly<
+  z.infer<typeof incidentObservationLinkSchema>
+>;
+export type Assertion = DeepReadonly<z.infer<typeof assertionSchema>>;
+export type CanonicalEvent = DeepReadonly<
+  z.infer<typeof canonicalEventSchema>
+>;
+export type EventEvidence = DeepReadonly<z.infer<typeof eventEvidenceSchema>>;
+export type ProtectiveAction = DeepReadonly<
+  z.infer<typeof protectiveActionSchema>
+>;
+export type IncidentStateSnapshot = DeepReadonly<
+  z.infer<typeof incidentStateSnapshotSchema>
+>;
+export type MaterialChange = DeepReadonly<z.infer<typeof materialChangeSchema>>;
+export type SourceHealthSample = DeepReadonly<
+  z.infer<typeof sourceHealthSampleSchema>
+>;
+export type TargetedSourceHealthSample = DeepReadonly<
+  z.infer<typeof targetedSourceHealthSampleSchema>
+>;
+export type AdapterFixture = DeepReadonly<z.infer<typeof adapterFixtureSchema>>;

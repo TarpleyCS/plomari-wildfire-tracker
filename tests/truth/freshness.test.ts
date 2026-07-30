@@ -1,13 +1,17 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  calculateCollectionTargetFreshness,
   calculateSourceFreshness,
+  getCollectionTarget,
   getSourceDefinition,
   type FreshnessInput,
 } from "../../lib/truth";
 
 const source = getSourceDefinition("fire-service-board");
 if (!source) throw new Error("Fire Service source missing");
+const target = getCollectionTarget("plomari-fire-service-board");
+if (!target) throw new Error("Fire Service collection target missing");
 
 const healthyInput: FreshnessInput = {
   now: "2026-07-30T00:10:00Z",
@@ -57,6 +61,12 @@ describe("source freshness state machine", () => {
       lastSuccessAt: "2026-07-30T00:05:00Z",
     });
     expect(result.collectorAgeSeconds).toBe(source.staleAfterSeconds);
+    expect(result.state).toBe("healthy");
+  });
+
+  it("uses the collection target freshness policy on the canonical path", () => {
+    const result = calculateCollectionTargetFreshness(target, healthyInput);
+    expect(result.staleAfterSeconds).toBe(target.staleAfterSeconds);
     expect(result.state).toBe("healthy");
   });
 });

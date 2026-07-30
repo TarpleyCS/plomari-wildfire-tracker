@@ -1,7 +1,7 @@
 # Data Truth Layer Specification
 
 **Status:** Draft for direction  
-**Version:** 0.1  
+**Version:** 0.2
 **Date:** 30 July 2026  
 **Project:** Plomari Wildfire Tracker
 
@@ -22,8 +22,9 @@ reliably answer:
 - Which critical sources are stale even though the application itself is up?
 
 The truth layer will ingest source data independently of page traffic, retain
-provenance and history, reconcile observations without hiding contradictions,
-and publish a stable incident read model to the map.
+global provenance and history, link relevant observations to one or more
+incidents without copying them, reconcile evidence without hiding
+contradictions, and publish stable incident read models to the map.
 
 ## 2. Product position
 
@@ -92,6 +93,8 @@ Current limitations:
 9. Keep protective-action flags restricted to validated official instructions.
 10. Retain the application's English and Greek presentation without translating
     or rewriting the underlying evidence.
+11. Support multiple simultaneous wildfire incidents without duplicating a
+    provider, endpoint, source item, or observation for every incident.
 
 ### 4.2 Success measures
 
@@ -130,10 +133,14 @@ The first implementation will not:
 
 | Term | Definition |
 | --- | --- |
-| Source | A provider or publication, such as FIRMS, the Fire Service board, or ERT |
-| Ingestion run | One attempt to retrieve a source at a recorded time |
+| Source provider | Organization-level identity and attribution, such as NASA Earthdata or the Hellenic Fire Service |
+| Source endpoint | One feed, account, page, station, dataset, imagery product, or model API with its own authority and license policy |
+| Collection target | A versioned request/query against an endpoint, including geography, cadence, and freshness policy |
+| Incident-source binding | Configuration that selects a collection target for an incident |
+| Ingestion run | One attempt to retrieve a collection target at a recorded time |
 | Source item | An immutable version of an upstream record, article, post, board row, sensor record, or model result |
-| Observation | A normalized representation of what a source measured, modeled, published, or reported |
+| Observation | A global normalized representation of what a source measured, modeled, published, or reported |
+| Incident-observation link | Immutable relevance evaluation connecting an observation to an incident and the AOI version used |
 | Assertion | One atomic claim extracted from an observation, such as `incident.status = in_progress` |
 | Canonical event | A durable incident object that groups related assertions and evidence |
 | Evidence link | A typed relationship between an event and supporting, updating, or contradicting evidence |
@@ -162,6 +169,20 @@ Store these independently:
 
 All stored timestamps use UTC. Source timezone and time precision are retained.
 Europe/Athens conversion is a presentation concern.
+
+Historical reads keep these clocks separate. An `effective_at`/`observed_at`
+selection answers what the evidence describes at a point in incident time;
+`known_at` limits the query to rows and publication decisions already recorded
+by that cutoff. The default historical map uses `known_at = now()` so later
+corrections are visible. Audit replay sets both cutoffs explicitly. Unknown
+times never receive a synthetic slider position, and date-only evidence is
+selected by its source calendar date rather than UTC midnight.
+
+Immutable snapshots initially support committed-snapshot replay only: select
+the newest snapshot whose `as_of` and database creation clock are within the
+two cutoffs. Recomputing a corrected historical composite from evidence learned
+later requires versioned bitemporal snapshot editions; the API must not imply
+that arbitrary stored snapshot JSON has already been retroactively rebuilt.
 
 ### 7.3 Evidence before interpretation
 
@@ -202,13 +223,20 @@ and a successfully observed absence are distinct states.
 
 ### 8.1 Components
 
-1. **Source registry**
-   - Stores source identity, authority scope, cadence, adapter version,
-     attribution, and freshness policy.
+1. **Source catalog and target registry**
+   - Separates organization-level providers, endpoint/product semantics,
+     collection targets, and incident-source bindings.
+   - Stores claim authority, content and license policy on each endpoint.
+   - Stores query geography, cadence, enablement, and freshness policy on each
+     collection target.
 
 2. **Collectors**
    - Run independently of page traffic.
-   - Retrieve one source per job with timeout, retry, and rate-limit handling.
+   - Retrieve one collection target per logical job with timeout, retry, and
+     rate-limit handling.
+   - Coalesce compatible target requests to the same endpoint where the
+     upstream API supports batching, while retaining target-specific runs and
+     health.
    - Record success, failure, latency, response metadata, and payload hash.
 
 3. **Raw evidence store**
@@ -216,32 +244,38 @@ and a successfully observed absence are distinct states.
    - Stores large payloads in object storage and hashes in PostgreSQL.
 
 4. **Normalizer**
-   - Converts source-specific payloads into source items and observations.
-   - Validates timestamps, coordinates, units, and incident relevance.
+   - Converts source-specific payloads into source items and global
+     observations.
+   - Validates timestamps, coordinates, units, and source semantics.
 
-5. **Assertion extractor**
+5. **Incident relevance linker**
+   - Evaluates global observations against configured incident bindings.
+   - Persists method, rationale, distance, and the exact incident AOI geometry
+     and version used, so later AOI edits never rewrite relevance history.
+
+6. **Assertion extractor**
    - Produces typed atomic claims from normalized observations.
    - Uses deterministic parsers for official statuses and instructions.
    - May use assistive classification for publisher content, clearly labeled as
      machine-derived.
 
-6. **Reconciliation engine**
+7. **Reconciliation engine**
    - Matches assertions to existing canonical events.
    - Records support, update, contradiction, retraction, and supersession.
 
-7. **Material-change engine**
+8. **Material-change engine**
    - Compares the new incident state with the previous committed state.
    - Emits explainable changes and an outbox record.
 
-8. **Read-model builder**
+9. **Read-model builder**
    - Produces denormalized current-state, timeline, map-object, and
      source-health views.
 
-9. **Public API**
+10. **Public API**
    - Serves only read models and evidence-safe detail.
    - Uses cursor pagination, ETags, and cache-aware responses.
 
-10. **Operations console**
+11. **Operations console**
     - Displays adapter health, quarantined records, contradictions, and
       material-change explanations.
     - Human adjudication is introduced only after read-only shadow operation.
@@ -266,19 +300,24 @@ long-term relational storage.
 ### 8.3 Collection model
 
 Collectors should run as scheduled jobs, not only inside public GET requests.
-Each job:
+The planner may batch compatible targets against one endpoint request, but it
+must never merge target health, cadence, or incident bindings. Each logical
+target job:
 
-1. acquires a source-specific advisory lock;
-2. creates an `ingestion_run`;
+1. acquires a collection-target-specific advisory lock;
+2. resolves the immutable `collection_target_revision` and creates an
+   `ingestion_run` keyed by both target and revision;
 3. retrieves the source with conditional headers where supported;
 4. stores response metadata and a content hash;
 5. exits idempotently if the payload has already been processed;
 6. creates new immutable versions when content changes;
-7. normalizes and validates the changed payload;
-8. runs reconciliation in the same transaction where practical;
-9. commits an incident-state snapshot and any material changes;
-10. writes notification candidates to an outbox;
-11. records final health and latency.
+7. normalizes and validates changed payload into global observations;
+8. evaluates configured incident bindings and records immutable relevance
+   links with the AOI version used;
+9. runs reconciliation in the same transaction where practical;
+10. commits incident-state snapshots and any material changes;
+11. writes notification candidates to an outbox;
+12. records final health and latency for the target.
 
 Retries must use exponential backoff with jitter. Authentication, quota, parser,
 timeout, and upstream HTTP failures remain separate error classes.
@@ -286,40 +325,91 @@ timeout, and upstream HTTP failures remain separate error classes.
 ## 9. Data model
 
 All primary identifiers should be application-generated UUIDv7 values. Every
-table includes `created_at`; mutable operational tables also include
-`updated_at`.
+contract-backed persisted record includes `contract_version`; every table
+includes `created_at`; mutable operational tables also include `updated_at`.
 
 ### 9.1 `incidents`
 
 | Field | Purpose |
 | --- | --- |
-| `id` | Stable incident identifier |
+| `contract_version`, `id` | Contract provenance and stable incident identifier |
 | `slug` | Public identifier, initially `plomari-2026-07-29` |
-| `name_en`, `name_el` | Display names |
+| `canonical_name`, `display_names` | Canonical and BCP-47-keyed localized names |
 | `started_at`, `ended_at` | Incident lifecycle |
 | `area_of_interest` | PostGIS polygon used for relevance queries |
+| `area_of_interest_version` | Monotonic version captured by every relevance evaluation |
 | `default_timezone` | `Europe/Athens` |
 | `lifecycle` | `active`, `monitoring`, `closed`, or `archived` |
 
-### 9.2 `sources`
+### 9.2 Source catalog and collection configuration
+
+#### `source_providers`
+
+Provider records identify an organization for attribution. They do not carry
+claim authority: one organization may publish products with materially
+different semantics.
 
 | Field | Purpose |
 | --- | --- |
-| `id`, `key` | Stable identity |
-| `name`, `homepage_url` | Attribution |
+| `contract_version`, `key` | Contract provenance and stable provider identity |
+| `name`, `homepage_url` | Organization attribution |
+| `default_license_policy` | Conservative fallback only; never authorizes an endpoint |
+| `notes` | Provider-level context |
+
+#### `source_endpoints`
+
+| Field | Purpose |
+| --- | --- |
+| `contract_version`, `id`, `key` | Contract provenance and stable product/account identity |
+| `provider_key`, `name`, `data_url` | Provider relationship and endpoint identity |
+| `endpoint_kind` | Feed, account, dataset, station, page, model, or imagery |
 | `source_kind` | Official alert, official status, sensor, model, broadcaster, publisher |
-| `authority_scopes` | Claim types for which the source is authoritative |
+| `authority_scopes` | Claim types for which this endpoint is authoritative |
+| `content_policy`, `license_policy` | Endpoint-specific storage, reuse, and display constraints |
+| `adapter_name`, `adapter_version` | Parser provenance |
+| `credential_ref` | Secret-manager or environment reference, never a credential value |
+
+#### `collection_targets`
+
+| Field | Purpose |
+| --- | --- |
+| `contract_version`, `id`, `key` | Contract provenance and stable collection identity |
+| `endpoint_id`, `target_kind` | Endpoint and global/area/point/station/account/feed/dataset scope |
+| `request_config`, `geometry`, `geometry_precision_m` | Query parameters and spatial scope |
 | `expected_cadence_seconds` | Used for freshness |
 | `stale_after_seconds` | Explicit stale threshold |
-| `adapter_name`, `adapter_version` | Parser provenance |
-| `enabled` | Operational control |
-| `license_policy` | Storage and display constraints |
+| `enabled_by_default` | Operational default for this target |
+
+#### `collection_target_revisions`
+
+Collection targets are stable identities; every operational configuration is
+an immutable revision. Editing coordinates, query parameters, endpoint,
+cadence, or enablement creates a new revision rather than changing history.
+
+| Field | Purpose |
+| --- | --- |
+| `contract_version`, `identity_algorithm_version`, `id` | Contract and hash provenance |
+| `collection_target_id`, `endpoint_id` | Stable target and endpoint used |
+| `version_number`, `supersedes_id` | Immutable revision chain |
+| `target_kind`, `request_config`, `geometry`, `geometry_precision_m` | Exact request and spatial configuration |
+| `expected_cadence_seconds`, `stale_after_seconds`, `enabled` | Exact operational policy |
+| `configuration_hash`, `created_at` | Canonical v2 hash and creation time |
+
+#### `incident_source_bindings`
+
+| Field | Purpose |
+| --- | --- |
+| `contract_version`, `id` | Contract provenance and stable binding identity |
+| `incident_id`, `collection_target_id` | Incident-to-target relationship |
+| `purpose`, `priority` | Primary, context, or fallback collection ordering |
+| `relevance_method`, `relevance_config` | Versioned geometry, keyword, identifier, or analyst policy |
+| `enabled` | Incident-specific operational control |
 
 ### 9.3 `ingestion_runs`
 
 | Field | Purpose |
 | --- | --- |
-| `id`, `source_id` | Attempt identity |
+| `contract_version`, `id`, `collection_target_id`, `collection_target_revision_id` | Attempt identity and exact target configuration |
 | `started_at`, `finished_at` | Collection timing |
 | `status` | `running`, `success`, `not_modified`, `partial`, `failed` |
 | `http_status`, `latency_ms` | Upstream health |
@@ -332,7 +422,8 @@ table includes `created_at`; mutable operational tables also include
 
 | Field | Purpose |
 | --- | --- |
-| `id`, `source_id` | Version identity |
+| `contract_version`, `identity_algorithm_version`, `id` | Version and hash provenance |
+| `source_endpoint_id`, `ingestion_run_id` | Registered endpoint and target-run provenance |
 | `external_id`, `canonical_url` | Upstream identity |
 | `version_number`, `supersedes_id` | Revision chain |
 | `content_hash` | Idempotency |
@@ -349,16 +440,28 @@ content hash, permitted excerpt, and extracted structured metadata.
 
 | Field | Purpose |
 | --- | --- |
-| `id`, `incident_id`, `source_item_id` | Provenance |
+| `contract_version`, `id`, `source_item_id` | Global provenance; no incident ownership |
 | `observation_type` | Thermal detection, satellite pass, official status, article, wind model, METAR, etc. |
 | `observed_at`, `effective_at` | Event time |
 | `geometry` | PostGIS point, line, or polygon where supplied |
 | `geometry_precision_m` | Spatial uncertainty |
 | `measurements` | Typed JSONB values and units |
 | `quality` | Source-provided quality, such as FIRMS confidence |
-| `relevance_method` | Exact identifier, geometry, keyword, or analyst link |
 | `parser_version` | Reproducibility |
 | `validation_state` | `accepted`, `quarantined`, or `rejected` |
+
+### 9.5a `incident_observation_links`
+
+An observation may be relevant to zero, one, or many incidents. Linking never
+copies or mutates the global observation.
+
+| Field | Purpose |
+| --- | --- |
+| `contract_version`, `id`, `incident_id`, `observation_id` | Immutable relevance identity |
+| `relevance_method`, `rationale_code` | Exact identifier, geometry, keyword, or analyst rationale |
+| `incident_area_version`, `incident_area_of_interest` | Exact AOI snapshot evaluated at link time |
+| `distance_to_area_km` | Deterministic spatial result when applicable |
+| `linked_at`, `linked_by` | Evaluation time and ruleset version |
 
 ### 9.6 `assertions`
 
@@ -366,7 +469,7 @@ Assertions are atomic and machine-readable.
 
 | Field | Purpose |
 | --- | --- |
-| `id`, `observation_id`, `incident_id` | Provenance |
+| `contract_version`, `id`, `observation_id`, `incident_id` | Provenance |
 | `subject_type`, `subject_key` | Incident, road, settlement, sector, source, etc. |
 | `predicate` | `status`, `instruction`, `threatens`, `closed`, `contains_thermal_anomaly`, etc. |
 | `value` | Typed JSONB object |
@@ -376,6 +479,7 @@ Assertions are atomic and machine-readable.
 | `extraction_method` | Deterministic parser, source field, analyst, or assistive classifier |
 | `extraction_version` | Rule or model version |
 | `state` | `active`, `superseded`, `retracted`, or `disputed` |
+| `recorded_at` | Assertion creation time; must exist before an evaluation can authorize it |
 
 ### 9.7 `canonical_events`
 
@@ -403,7 +507,8 @@ Assertions are atomic and machine-readable.
 
 | Field | Purpose |
 | --- | --- |
-| `id`, `incident_id`, `sequence` | Ordered state |
+| `contract_version`, `identity_algorithm_version`, `id` | Contract, hash provenance, and identity |
+| `incident_id`, `sequence` | Ordered state |
 | `calculated_at` | System time |
 | `state_hash` | Idempotency |
 | `state` | Denormalized JSONB read model |
@@ -424,7 +529,9 @@ Assertions are atomic and machine-readable.
 
 ### 9.11 `source_health_samples`
 
-Retains source status over time without treating it as incident evidence:
+Each canonical sample is keyed by `collection_target_id` and
+`collection_target_revision_id`, not provider or incident, and retains target
+status over time without treating it as incident evidence:
 
 - last successful retrieval;
 - last changed payload;
@@ -442,21 +549,35 @@ Apply identity rules in this order:
 1. source-provided stable identifier;
 2. normalized canonical URL;
 3. sensor-specific natural key;
-4. source ID plus normalized timestamp plus payload hash.
+4. source endpoint ID plus normalized timestamp plus payload hash.
+
+Every persisted identity key begins with `identity_algorithm_version`. Identity
+algorithm `2.0.0` uses deterministic ECMAScript code-unit ordering. Algorithm
+`1.0.0` hashes are read-only and are never recomputed; a version change creates
+an explicit `identity_rebaseline` source revision even when source content is
+otherwise unchanged.
 
 FIRMS detection natural key:
 
-`product + satellite + observed_at + rounded_lat + rounded_lon + scan + track`
+`identity_version + product + satellite + observed_at + rounded_lat + rounded_lon + scan + track`
+
+Missing FIRMS scan or track values remain `null` and contribute an explicit
+`null` token to identity. They are never synthesized. Canonical JSON and URL
+parameters sort by ECMAScript code-unit order, not process locale, before
+hashing.
 
 Satellite pass identity:
 
-`product + satellite + pass_start`, where detections no more than ten minutes
-apart belong to the same detecting pass.
+`identity_version + product + satellite + pass_start`, where detections no more
+than ten minutes apart belong to the same detecting pass. Equal timestamps use
+natural-key code-unit tie-breakers, never input order.
 
 Source revisions:
 
 - same external ID and same content hash: no new version;
 - same external ID and changed content hash: new version with `supersedes_id`;
+- changed identity-algorithm major: new `identity_rebaseline` version while the
+  prior hash remains immutable;
 - deleted upstream item: retain evidence and mark availability separately;
 - source correction: create a new observation and supersede affected
   assertions.
@@ -469,7 +590,13 @@ values. An official instruction is never merged into a publisher report.
 
 ### 11.1 Official protective instructions
 
-- Create only from a validated official-alert adapter.
+- Create only after validating the complete endpoint → endpoint-bound source
+  item → global observation → incident-observation link → assertion ID chain.
+- Require an accepted protective-instruction observation, claim-specific
+  official-alert endpoint authority, an active deterministic/source-field
+  assertion, and an assertion that was already recorded, is effective, and is
+  unexpired at evaluation. Evidence, relevance links, and assertions created
+  after the evaluation time cannot authorize a retrospective action.
 - Preserve the original instruction text and direct source URL.
 - Extract origin, destination, affected area, issued time, and expiration only
   when explicitly present.
@@ -561,9 +688,9 @@ Freshness has three independent dimensions:
 3. **Observation freshness:** when the underlying event or measurement
    occurred.
 
-Initial source policies:
+Initial Plomari collection-target policies:
 
-| Source | Collection target | Stale threshold | Notes |
+| Endpoint/product | Target cadence | Stale threshold | Notes |
 | --- | --- | --- | --- |
 | Official 112 account, when configured | 60 seconds | 3 minutes | Optional API must not be the only alert path |
 | Fire Service board | 60 seconds | 5 minutes collector / source age shown separately | Board may publish less frequently |
@@ -572,10 +699,11 @@ Initial source policies:
 | Open-Meteo | 5 minutes | 15 minutes collector | Model cycle age must be exposed |
 | LGMT METAR | 5 minutes | 20 minutes collector / 90 minutes observation | Airport is not the fireground |
 
-Future timestamps, invalid coordinates, impossible units, and timestamps older
-than the incident relevance window are quarantined rather than silently used.
-Date-only records retain date-only precision and never display a fabricated
-exact age.
+Future timestamps, invalid coordinates, and impossible units are quarantined
+rather than silently used. An otherwise valid global observation outside one
+incident's relevance window is not quarantined; it simply does not receive a
+link to that incident. Date-only records retain date-only precision and never
+display a fabricated exact age.
 
 ## 14. Public API
 
@@ -809,10 +937,15 @@ expired without deleting normalized provenance.
 - Move shared source and event types into versioned modules.
 - Capture sanitized fixtures for every adapter, including failures and
   corrections.
-- Define JSON Schemas for source items, observations, assertions, events,
-  snapshots, and changes.
+- Define JSON Schemas for incidents, providers, endpoints, collection targets,
+  incident bindings, source items, global observations, relevance links,
+  assertions, events, snapshots, changes, and target health.
 - Add replay and idempotency tests.
-- Finalize source authority and freshness registry.
+- Finalize endpoint authority/licensing and target freshness registries.
+- Deep-freeze exported registries and expose deeply readonly contract types.
+- Complete the pre-deployment identity `2.0.0` rebaseline, preserving all stored
+  `1.0.0` hashes as read-only evidence, and approve the golden JSON Schema
+  digest before provisioning persistence.
 
 **Exit criterion:** Every current upstream response can be normalized from a
 fixture with deterministic results.
@@ -820,9 +953,11 @@ fixture with deterministic results.
 ### Phase 1 — Persistent ingestion in shadow mode
 
 - Provision PostgreSQL/PostGIS and raw object storage.
-- Add migrations and source registry.
+- Add migrations, source catalog, target registry, immutable target revisions,
+  and incident bindings.
 - Move collectors out of public GET handlers.
-- Persist ingestion runs, source items, observations, and source health.
+- Persist ingestion runs with their exact target-revision IDs, endpoint-bound
+  source items, observations, and target health.
 - Continue serving the existing version 2 APIs.
 - Compare persisted results with current live route outputs.
 
@@ -890,13 +1025,33 @@ material change from evidence.
     leaking secret names beyond documented environment-variable labels.
 15. Simulate a database write failure; no notification is emitted for
     uncommitted evidence.
+16. Link one global observation to two overlapping incidents; one observation
+    and two AOI-versioned relevance links exist, with no copied evidence.
+17. Omit `contractVersion` from each canonical persisted entity, or label a
+    legacy `1.0.0` payload as `1.1.0`; validation fails unless the explicitly
+    named compatibility adapter performs and records the upgrade.
+18. Change a target request configuration; a new immutable target revision and
+    configuration hash are created, while earlier runs retain their original
+    target-revision references.
+19. Attempt to create a protective action from a retracted, expired, or
+    not-yet-recorded assertion, a mismatched endpoint/source-item ID, or a
+    mismatched observation/link ID; every invalid provenance chain is rejected.
+20. Reverse equal-timestamp FIRMS detections; pass membership, ordering, and
+    pass identities remain byte-for-byte identical.
+21. Re-evaluate a stored `1.0.0` identity under `2.0.0`; the old hash is not
+    recomputed and an explicit `identity_rebaseline` revision is produced.
+22. Regenerate JSON Schemas; required fields, version constants, identifier
+    patterns, negative cases, runtime-refinement annotations, and the reviewed
+    golden digest remain stable.
 
 ## 22. Initial implementation epics
 
-### Epic A — Contracts and source registry
+### Epic A — Contracts, source catalog, and target registry
 
 - shared TypeScript domain package;
-- source authority and freshness configuration;
+- endpoint authority/licensing and target freshness configuration;
+- immutable, hashed target revisions referenced by every targeted run;
+- explicit legacy upgrade adapters and identity-major rebaseline policy;
 - JSON Schema validation;
 - sanitized adapter fixtures.
 
@@ -943,7 +1098,7 @@ material change from evidence.
 | Managed database vendor | Any managed PostgreSQL service with PostGIS, point-in-time recovery, and regional placement suitable for the project |
 | Scheduler/worker runtime | Independent scheduled worker with at-least-once delivery and PostgreSQL advisory locks |
 | Raw payload storage | Encrypted object storage with lifecycle deletion |
-| Initial incident scope | One incident, with multi-incident-compatible identifiers |
+| Initial incident scope | Plomari is the first target profile; providers, endpoints, observations, and scheduling are global and multi-incident |
 | Public transport | Poll version 3 changes using cursor and ETag |
 | Notifications | Operations-only dry run until material-change precision is reviewed |
 | Analyst tools | Read-only health/contradiction console before write access |
@@ -958,6 +1113,6 @@ Before provisioning persistence or changing production ingestion, confirm:
 1. the managed PostgreSQL provider;
 2. the scheduled worker runtime;
 3. whether raw publisher responses may be retained for up to 30 days;
-4. whether the tracker remains Plomari-specific through Phase 3;
+4. which incident becomes the second profile after Plomari validates the
+   multi-incident path;
 5. who may adjudicate disputed events in Phase 4.
-

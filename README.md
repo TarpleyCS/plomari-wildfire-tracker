@@ -1,10 +1,18 @@
 # Plomari Wildfire Tracker
 
-A public, mobile-friendly situational-awareness map for the 29 July 2026
-Plomari wildfire on Lesvos, Greece. It combines source-labeled official
-instructions, satellite thermal detections, local field reporting, detailed
-modeled wind, a measured airport observation, a smoke transport proxy, and a
-clearly marked spread-scenario tool.
+A public, mobile-friendly situational-awareness map first deployed for the
+29 July 2026 Plomari wildfire on Lesvos, Greece. It combines source-labeled
+official instructions, satellite thermal detections, local field reporting,
+detailed modeled wind, a measured airport observation, a smoke transport proxy,
+and a clearly marked spread-scenario tool.
+
+The repository is now also building the production foundation for a global,
+multi-incident wildfire platform. The current public map remains Plomari-
+specific while the new Supabase/PostGIS truth layer runs through migration,
+fixture replay, shadow ingestion, and safety review before any cutover.
+The broader situational-awareness direction is inspired by
+[VrushankPatel/godseye](https://github.com/VrushankPatel/godseye), with this
+project supplying its own evidence-first wildfire backend.
 
 The interface is localized in English and Greek. It follows the browser
 language on first load, remembers the selected language, and keeps the original
@@ -50,6 +58,10 @@ language on first load, remembers the selected language, and keeps the original
 - A map-first phone layout with a safe-area-aware bottom dock, mutually
   exclusive Layers and Updates sheets, 44px-or-larger touch targets, and a
   compact official-status/wind ribbon.
+- An explicit **Live / as-of** scrubber from incident start to now. Historical
+  view admits only known source or observation times at or before the cutoff;
+  latest-only wind, source health, Fire Service board state, and daily current
+  rasters are clearly withheld rather than presented as historical evidence.
 
 There is no personal location tracking, GPS prompt, user marker, account data,
 or user-specific status in this repository.
@@ -148,7 +160,8 @@ provider attribution displayed on the map.
 
 ## Run locally
 
-Requirements: Node.js 20.9 or newer.
+Requirements: Node.js 20 (20.19+), Node.js 22 (22.12+), or Node.js 24+
+(see the exact supported range in `package.json`).
 
 ```bash
 npm install
@@ -181,8 +194,7 @@ their values in browser code, or commit `.env.local`.
 Production validation:
 
 ```bash
-npm run lint
-npm run build
+npm run check
 npm start
 ```
 
@@ -233,17 +245,62 @@ The next architecture phase moves source collection and incident history out of
 request-time API composition and into an append-only, auditable data layer.
 
 - [Data truth layer specification](docs/data-truth-layer-spec.md)
+- [Production architecture and rollout gates](docs/production-architecture.md)
+- [Source integration roadmap and Godseye gap audit](docs/source-integration-roadmap.md)
 - [`lib/truth`](lib/truth) contains the initial shared domain contracts,
-  source-authority registry, and deterministic freshness calculation.
+  provider/endpoint/target registries, source-authority rules, global
+  observation contracts, and deterministic freshness calculation.
 - [`lib/truth/v1`](lib/truth/v1) contains strict runtime contracts,
   deterministic identity rules, fixture replay, and Draft 2020-12 JSON Schema
   exports.
 - [Truth contract versioning](docs/truth-contract-versioning.md) defines
   compatibility, identity, quarantine, and fixture policy.
 
-The scaffold does not yet provision a database or change production ingestion.
-Those changes will run in shadow mode before the public map switches to the
-version 3 read model.
+The CLI-generated [`supabase`](supabase) project contains the initial private
+PostGIS truth schema, access boundary, database tests, and seed catalog. The
+migration is local development work and has not been applied to the live
+Supabase project. Collection and read-model changes will run in shadow mode
+before the public map switches to a new read model.
+
+## Supabase development
+
+The local database requires Docker and the Supabase CLI:
+
+```bash
+supabase db start
+supabase db lint --local --schema core,ingest,truth,api --level error --fail-on error
+supabase test db
+```
+
+`supabase/config.toml` exposes only the curated `api` schema through the local
+Data API. The `core`, `ingest`, and `truth` schemas are private. Use a separate
+non-production Supabase branch for the first hosted migration rehearsal; do not
+push an unreviewed migration directly to production.
+
+The migration defines separate no-login capability roles for catalog work,
+collection, reconciliation, publication, and outbox delivery. It does not
+create passwords. Provision and rotate production workload identities outside
+the migration, grant each identity exactly one capability role, and never use a
+generic Supabase `service_role` key as a shared private-schema writer.
+
+Larger raw responses use a private, content-addressed `raw-evidence` Storage
+bucket. Runtime workers can insert and verify SHA-256-derived objects but cannot
+overwrite/delete them or make the bucket public; retention is an explicit
+operator workflow. Storage uploads use short-lived server-only collector-role
+tokens; no JWT signing key or collector token belongs in Vercel client code.
+Supabase's managed `service_role` remains a BYPASSRLS platform-root secret with
+Storage access; it must never be distributed to browsers or used as a shared
+worker credential. Deployments that require hard isolation from that root use
+client-side envelope encryption with a separately held key or a separate object
+store/security boundary.
+Supabase's managed `service_role` remains a root credential with Storage access
+and must not be used by application or worker code. Cryptographic isolation
+from that credential requires worker-side encryption with a separately held key
+or a separate object store, not Storage RLS alone.
+
+CI repeats the migration, seed, database lint, and pgTAP checks against an
+ephemeral local Postgres instance; it never links to or modifies the hosted
+project.
 
 ## Project structure
 
@@ -257,6 +314,9 @@ app/
   page.tsx           # Leaflet map, layers, timeline, and scenarios
 public/
   favicon.svg
+supabase/
+  migrations/      # versioned PostGIS truth-layer DDL
+  tests/           # pgTAP access, immutability, and integrity tests
 ```
 
 ## Design attribution

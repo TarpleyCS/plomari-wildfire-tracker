@@ -1,6 +1,15 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  PLOMARI_COLLECTION_TARGET_REVISIONS,
+  PLOMARI_COLLECTION_TARGETS,
+  PLOMARI_INCIDENT_SOURCE_BINDINGS,
+  SOURCE_ENDPOINTS,
+  SOURCE_PROVIDERS,
+  calculateCollectionTargetRevisionHash,
+  validateCollectionRegistry,
+} from "../../lib/truth/collection-registry";
+import {
   SOURCE_REGISTRY,
   validateSourceRegistry,
 } from "../../lib/truth/source-registry";
@@ -28,6 +37,96 @@ function fixtureById(id: string) {
 describe("source registry and adapter fixture corpus", () => {
   it("validates the complete source registry", () => {
     expect(validateSourceRegistry()).toEqual([]);
+  });
+
+  it("validates provider, endpoint, target, and incident-binding references", () => {
+    expect(validateCollectionRegistry()).toEqual([]);
+    expect(SOURCE_ENDPOINTS).toHaveLength(PLOMARI_COLLECTION_TARGETS.length);
+    expect(PLOMARI_COLLECTION_TARGET_REVISIONS).toHaveLength(
+      PLOMARI_COLLECTION_TARGETS.length,
+    );
+    expect(PLOMARI_INCIDENT_SOURCE_BINDINGS).toHaveLength(
+      PLOMARI_COLLECTION_TARGETS.length,
+    );
+  });
+
+  it("deep-freezes registry records and nested target configuration", () => {
+    const openMeteo = PLOMARI_COLLECTION_TARGETS.find(
+      (target) => target.key === "plomari-open-meteo",
+    );
+    const variables = openMeteo?.requestConfig.variables;
+
+    expect(Object.isFrozen(SOURCE_PROVIDERS)).toBe(true);
+    expect(Object.isFrozen(SOURCE_PROVIDERS[0])).toBe(true);
+    expect(Object.isFrozen(SOURCE_REGISTRY)).toBe(true);
+    expect(Object.isFrozen(SOURCE_REGISTRY[0]?.authorityScopes)).toBe(true);
+    expect(Object.isFrozen(PLOMARI_COLLECTION_TARGETS)).toBe(true);
+    expect(Object.isFrozen(openMeteo?.requestConfig)).toBe(true);
+    expect(Object.isFrozen(variables)).toBe(true);
+    expect(PLOMARI_COLLECTION_TARGET_REVISIONS.every(Object.isFrozen)).toBe(
+      true,
+    );
+  });
+
+  it("hashes every immutable target revision and changes on configuration drift", () => {
+    PLOMARI_COLLECTION_TARGET_REVISIONS.forEach((revision) => {
+      expect(calculateCollectionTargetRevisionHash(revision)).toBe(
+        revision.configurationHash,
+      );
+      expect(
+        calculateCollectionTargetRevisionHash({
+          ...revision,
+          staleAfterSeconds: revision.staleAfterSeconds + 1,
+        }),
+      ).not.toBe(revision.configurationHash);
+    });
+  });
+
+  it("keeps product authority and licensing below the organization level", () => {
+    const nasa = SOURCE_PROVIDERS.find(
+      (provider) => provider.key === "nasa-earthdata",
+    );
+    const firms = SOURCE_ENDPOINTS.find(
+      (endpoint) => endpoint.key === "firms-noaa20",
+    );
+    const gibs = SOURCE_ENDPOINTS.find(
+      (endpoint) => endpoint.key === "nasa-gibs-imagery",
+    );
+
+    expect(nasa).not.toHaveProperty("authorityScopes");
+    expect(firms?.authorityScopes).toEqual(["thermal_anomaly"]);
+    expect(gibs?.authorityScopes).toEqual(["satellite_imagery"]);
+    expect(firms?.licensePolicy).toBeTruthy();
+    expect(gibs?.licensePolicy).toBeTruthy();
+  });
+
+  it("contains Plomari query semantics only in collection targets", () => {
+    const endpoint = SOURCE_ENDPOINTS.find(
+      (candidate) => candidate.key === "open-meteo-forecast",
+    );
+    const target = PLOMARI_COLLECTION_TARGETS.find(
+      (candidate) => candidate.key === "plomari-open-meteo",
+    );
+
+    expect(endpoint?.name).not.toMatch(/Plomari/i);
+    expect(target?.requestConfig).toMatchObject({
+      latitude: 38.989013,
+      longitude: 26.382489,
+      timezone: "Europe/Athens",
+    });
+
+    const gibsTarget = PLOMARI_COLLECTION_TARGETS.find(
+      (candidate) => candidate.key === "plomari-gibs",
+    );
+    expect(gibsTarget?.requestConfig).toMatchObject({
+      thermalLayers: [
+        "VIIRS_NOAA20_Thermal_Anomalies_375m_All",
+        "VIIRS_NOAA21_Thermal_Anomalies_375m_All",
+        "VIIRS_SNPP_Thermal_Anomalies_375m_All",
+      ],
+      aerosolLayer:
+        "VIIRS_NOAA20_Aerosol_Type_Deep_Blue_Land_Ocean_v2.1_NRT",
+    });
   });
 
   it("keeps source keys and fixture ids unique", () => {
@@ -140,6 +239,7 @@ describe("deterministic fixture replay", () => {
           id: IDS.sourceItem,
           versionNumber: 1,
           contentHash: first.contentHash!,
+          identityAlgorithmVersion: "2.0.0",
         },
         recordedAt: "2026-07-30T00:30:01Z",
       });
@@ -167,6 +267,7 @@ describe("deterministic fixture replay", () => {
           id: IDS.sourceItem,
           versionNumber: 1,
           contentHash: first.contentHash!,
+          identityAlgorithmVersion: "2.0.0",
         },
         recordedAt: "2026-07-30T00:35:01Z",
       },
@@ -176,6 +277,29 @@ describe("deterministic fixture replay", () => {
     expect(corrected.semanticDelta).toBe("corrected");
     expect(corrected.sourceItem?.versionNumber).toBe(2);
     expect(corrected.sourceItem?.supersedesId).toBe(IDS.sourceItem);
+  });
+
+  it("creates a new version when legacy identity hashes are rebaselined", () => {
+    const fixture = fixtureById("firms-noaa20-success");
+    const first = replayAdapterFixture(fixture, {
+      sourceItemId: IDS.sourceItem,
+      priorSourceItem: null,
+      recordedAt: "2026-07-30T00:30:01Z",
+    });
+    const rebaselined = replayAdapterFixture(fixture, {
+      sourceItemId: "0198a1b2-c3d4-7e5f-8a9b-001122334413",
+      priorSourceItem: {
+        id: IDS.sourceItem,
+        versionNumber: 1,
+        contentHash: first.contentHash!,
+        identityAlgorithmVersion: "1.0.0",
+      },
+      recordedAt: "2026-07-30T00:30:01Z",
+    });
+
+    expect(rebaselined.semanticDelta).toBe("identity_rebaselined");
+    expect(rebaselined.sourceItem?.versionNumber).toBe(2);
+    expect(rebaselined.sourceItem?.identityAlgorithmVersion).toBe("2.0.0");
   });
 
   it("treats a successful zero-row FIRMS response as no detections, not all-clear", () => {

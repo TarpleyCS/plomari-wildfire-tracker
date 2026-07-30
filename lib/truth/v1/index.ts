@@ -1,6 +1,15 @@
 export * from "./constants";
+export * from "./compatibility";
 export * from "./fixture-replay";
 export * from "./identity";
 export * from "./json-schema";
 export * from "./schemas";
-export * from "./semantics";
+export {
+  isValidationReasonCode,
+  validateObservationTimes,
+  validateProtectiveActionProvenance,
+  validateSourceRegistryDefinitions,
+  validateTemporalValue,
+  type ProtectiveActionProvenance,
+  type SemanticValidationResult,
+} from "./semantics";

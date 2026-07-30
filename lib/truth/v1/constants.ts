@@ -1,4 +1,49 @@
-export const CONTRACT_VERSION = "1.0.0" as const;
+export const CONTRACT_VERSION = "1.1.0" as const;
+export const LEGACY_CONTRACT_VERSION = "1.0.0" as const;
+
+/**
+ * Major v2 replaces locale-sensitive ordering with deterministic ECMAScript
+ * code-unit ordering. Hashes created with v1 are retained, never recomputed.
+ */
+export const IDENTITY_ALGORITHM_VERSION = "2.0.0" as const;
+export const LEGACY_IDENTITY_ALGORITHM_VERSION = "1.0.0" as const;
+export const identityAlgorithmVersions = [
+  LEGACY_IDENTITY_ALGORITHM_VERSION,
+  IDENTITY_ALGORITHM_VERSION,
+] as const;
+
+export const incidentLifecycles = [
+  "active",
+  "monitoring",
+  "closed",
+  "archived",
+] as const;
+
+export const sourceEndpointKinds = [
+  "feed",
+  "account",
+  "dataset",
+  "station",
+  "page",
+  "model",
+  "imagery",
+] as const;
+
+export const collectionTargetKinds = [
+  "global",
+  "geographic_area",
+  "point",
+  "station",
+  "account",
+  "feed",
+  "dataset",
+] as const;
+
+export const incidentSourceBindingPurposes = [
+  "primary",
+  "context",
+  "fallback",
+] as const;
 
 export const sourceKinds = [
   "official_alert",
@@ -51,6 +96,10 @@ export const validationReasonCodes = [
   "untrusted_protective_instruction",
   "publisher_cannot_issue_protective_action",
   "parser_schema_drift",
+  "provenance_chain_mismatch",
+  "provenance_timing_mismatch",
+  "inactive_assertion",
+  "expired_assertion",
 ] as const;
 
 export const assertionTypes = [

@@ -1,8 +1,12 @@
 import { getSourceDefinition } from "../source-registry";
 import {
+  CONTRACT_VERSION,
+  IDENTITY_ALGORITHM_VERSION,
+} from "./constants";
+import {
   decideSourceRevision,
   hashJson,
-  sourceItemSemanticKey,
+  legacySourceItemSemanticKey,
 } from "./identity";
 import {
   adapterFixtureSchema,
@@ -20,6 +24,7 @@ export type FixtureReplayContext = {
         readonly id: string;
         readonly versionNumber: number;
         readonly contentHash: string;
+        readonly identityAlgorithmVersion: "1.0.0" | "2.0.0";
       }
     | null;
   readonly recordedAt: string;
@@ -38,7 +43,11 @@ export type FixtureReplayResult = {
   readonly sourceItem: SourceItem | null;
   readonly semanticKey: string | null;
   readonly contentHash: string | null;
-  readonly semanticDelta: "created" | "corrected" | "none";
+  readonly semanticDelta:
+    | "created"
+    | "corrected"
+    | "identity_rebaselined"
+    | "none";
   readonly protectiveActionCount: number;
 };
 
@@ -113,9 +122,10 @@ export function replayAdapterFixture(
     adapterName: fixture.adapterName,
     responseBody: fixture.transport.body,
   };
-  const contentHash = hashJson(rawPayload);
+  const contentHash = hashJson(rawPayload, IDENTITY_ALGORITHM_VERSION);
   const externalId = fixture.identityKey ?? fixture.id;
-  const semanticKey = sourceItemSemanticKey({
+  const semanticKey = legacySourceItemSemanticKey({
+    identityAlgorithmVersion: IDENTITY_ALGORITHM_VERSION,
     sourceKey: fixture.sourceKey,
     externalId,
     canonicalUrl: fixture.request.url,
@@ -126,7 +136,10 @@ export function replayAdapterFixture(
   const revision =
     context.priorSourceItem === null
       ? null
-      : decideSourceRevision(context.priorSourceItem, contentHash);
+      : decideSourceRevision(context.priorSourceItem, {
+          contentHash,
+          identityAlgorithmVersion: IDENTITY_ALGORITHM_VERSION,
+        });
   if (revision?.kind === "identical") {
     return {
       fixtureId: fixture.id,
@@ -142,7 +155,9 @@ export function replayAdapterFixture(
   const semanticDelta =
     revision === null
       ? "created"
-      : "corrected";
+      : revision.kind === "identity_rebaseline"
+        ? "identity_rebaselined"
+        : "corrected";
   const versionNumber =
     revision
       ? revision.nextVersionNumber
@@ -151,6 +166,8 @@ export function replayAdapterFixture(
     revision ? context.priorSourceItem?.id ?? null : null;
 
   const sourceItem = sourceItemSchema.parse({
+    contractVersion: CONTRACT_VERSION,
+    identityAlgorithmVersion: IDENTITY_ALGORITHM_VERSION,
     id: context.sourceItemId,
     sourceKey: fixture.sourceKey,
     externalId,
